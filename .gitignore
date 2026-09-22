@@ -1,12 +1,7 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
-!.env.example
+# Ignore everything by default
+/*
 
-# AI Studio platform & build configuration
-metadata.json
-vite.config.ts
+# Allow only index.html, README.md, and .gitignore
+!/index.html
+!/README.md
+!/.gitignore
