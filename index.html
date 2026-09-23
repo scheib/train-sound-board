@@ -172,9 +172,37 @@
           </div>
         </div>
 
+        <!-- Diagnostics Toast Notification -->
+        <div id="log-toast-banner" style="position:fixed; top:18px; left:50%; transform:translateX(-50%); background:#212121; color:#ffffff; padding:8px 16px; border-radius:20px; font-family:sans-serif; font-size:12px; font-weight:600; box-shadow:0 4px 12px rgba(0,0,0,0.35); pointer-events:none; opacity:0; transition:opacity 0.25s, transform 0.25s; z-index:9999;">
+          Diagnostic logs copied to clipboard!
+        </div>
+
         <!-- Control cart console -->
         <div style="position:relative; z-index:10; width:100%; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; padding:16px 16px 40px 16px; background:linear-gradient(to top, #c9c2b1, #dcd6c7, #e6e1d4); border-top:8px solid #9e9684; box-shadow:0 -12px 28px rgba(0,0,0,0.22);">
-          <div style="width:100%; max-width:440px; background:#bbb3a1; padding:24px; border-radius:28px; box-shadow:inset 0 4px 8px rgba(0,0,0,0.25), 0 6px 14px rgba(0,0,0,0.18); border:4px solid #8e8674; display:flex; align-items:center; justify-content:space-around; gap:32px;">
+          <div style="position:relative; width:100%; max-width:440px; background:#bbb3a1; padding:24px; border-radius:28px; box-shadow:inset 0 4px 8px rgba(0,0,0,0.25), 0 6px 14px rgba(0,0,0,0.18); border:4px solid #8e8674; display:flex; align-items:center; justify-content:space-around; gap:32px;">
+            <!-- Ladybug Diagnostics & Copy Logs Tool -->
+            <button id="ladybug-log-btn" aria-label="Copy Diagnostic Logs" title="Tap to copy diagnostic logs" style="position:absolute; top:8px; right:12px; background:none; border:none; padding:4px; cursor:pointer; outline:none; display:flex; flex-direction:column; align-items:center; opacity:0.85; transition:transform 0.15s, opacity 0.15s; touch-action:manipulation; z-index:20;">
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+                <!-- Ladybug Body & Head -->
+                <circle cx="12" cy="14" r="8" fill="#d32f2f" stroke="#212121" stroke-width="1.2" />
+                <path d="M 12 6 L 12 22" stroke="#212121" stroke-width="1.4" />
+                <path d="M 7 9 Q 12 5 17 9 Z" fill="#212121" />
+                <!-- Antennae -->
+                <path d="M 10 6 Q 8 3 6 4" stroke="#212121" stroke-width="1.2" stroke-linecap="round" fill="none" />
+                <path d="M 14 6 Q 16 3 18 4" stroke="#212121" stroke-width="1.2" stroke-linecap="round" fill="none" />
+                <!-- Spots -->
+                <circle cx="9" cy="11.5" r="1.4" fill="#212121" />
+                <circle cx="15" cy="11.5" r="1.4" fill="#212121" />
+                <circle cx="8" cy="16.5" r="1.4" fill="#212121" />
+                <circle cx="16" cy="16.5" r="1.4" fill="#212121" />
+                <!-- Legs -->
+                <path d="M 5 12 L 2 11" stroke="#212121" stroke-width="1.2" stroke-linecap="round" />
+                <path d="M 5 15 L 2 16" stroke="#212121" stroke-width="1.2" stroke-linecap="round" />
+                <path d="M 19 12 L 22 11" stroke="#212121" stroke-width="1.2" stroke-linecap="round" />
+                <path d="M 19 15 L 22 16" stroke="#212121" stroke-width="1.2" stroke-linecap="round" />
+              </svg>
+              <span id="ladybug-toast" style="font-size:9px; font-weight:700; color:#4a4437; letter-spacing:0.5px; margin-top:2px;">LOGS</span>
+            </button>
             <!-- Horn Button -->
             <button id="standalone-horn-btn" aria-label="Horn" style="background:none; border:none; padding:0; cursor:pointer; outline:none; border-radius:50%; touch-action:manipulation;">
               <div style="width:120px; height:120px; border-radius:50%; background:linear-gradient(to bottom, #ded8cb, #a8a191, #6d6657); padding:10px; box-shadow:0 8px 16px rgba(0,0,0,0.35), inset 0 2px 4px rgba(255,255,255,0.8); display:flex; align-items:center; justify-content:center;">
@@ -204,105 +232,219 @@
     <!-- Standalone self-contained audio engine with lush mountain reverb & valley echo -->
     <script>
       (function() {
+        // --- Verbose Diagnostic In-Memory Logger ---
+        var logHistory = [];
+        function log(category, message, data) {
+          var now = new Date();
+          var timeStr = now.toISOString().substring(11, 23);
+          var entry = '[' + timeStr + '][' + category + '] ' + message;
+          if (data !== undefined) {
+            try {
+              if (typeof data === 'object') entry += ' | ' + JSON.stringify(data);
+              else entry += ' | ' + String(data);
+            } catch (err) {
+              entry += ' | [unstringifiable data]';
+            }
+          }
+          logHistory.push(entry);
+          if (logHistory.length > 500) logHistory.shift();
+          try {
+            console.log(entry);
+          } catch (e) {}
+        }
+
+        // Catch global unhandled errors
+        window.addEventListener('error', function(e) {
+          log('ERROR', 'Global window error: ' + (e.message || 'unknown'), {
+            filename: e.filename,
+            lineno: e.lineno,
+            colno: e.colno
+          });
+        });
+
+        window.addEventListener('unhandledrejection', function(e) {
+          log('PROMISE-REJECT', 'Unhandled Promise: ' + (e.reason ? (e.reason.message || String(e.reason)) : 'unknown'));
+        });
+
+        // Device environment info
+        log('ENV', 'UserAgent: ' + navigator.userAgent);
+        log('ENV', 'Platform: ' + navigator.platform + ', maxTouchPoints: ' + (navigator.maxTouchPoints || 0));
+        log('ENV', 'AudioContext Support: ' + (!!(window.AudioContext || window.webkitAudioContext)));
+
         var ctx = null;
         var masterBus = null;
+        var isAudioUnlocked = false;
         var hornActive = false;
         var hornStart = 0;
         var hornNodes = null;
         var hornGain = null;
         var bellStrikeCount = 0;
 
+        // --- iOS AudioContext & Buffer Unlocker ---
         function getAudioCtx() {
           if (!ctx) {
             var Ctx = window.AudioContext || window.webkitAudioContext;
-            ctx = new Ctx({ latencyHint: 'interactive' });
+            if (!Ctx) {
+              log('AUDIO-FATAL', 'AudioContext is NOT supported on this browser');
+              return null;
+            }
+            try {
+              // Try standard constructor with interactive latency
+              ctx = new Ctx({ latencyHint: 'interactive' });
+              log('AUDIO-INIT', 'Created AudioContext with latencyHint: interactive. State: ' + ctx.state);
+            } catch (e) {
+              log('AUDIO-WARN', 'Failed creating AudioContext with options, retrying without options: ' + e.message);
+              try {
+                ctx = new Ctx();
+                log('AUDIO-INIT', 'Created fallback AudioContext. State: ' + ctx.state);
+              } catch (err2) {
+                log('AUDIO-FATAL', 'Failed creating any AudioContext: ' + err2.message);
+                return null;
+              }
+            }
+
+            // Monitor context state transitions
+            if (ctx.onstatechange !== undefined) {
+              ctx.onstatechange = function() {
+                log('AUDIO-STATE', 'AudioContext state changed to: ' + ctx.state + ', currentTime: ' + ctx.currentTime);
+              };
+            }
+
             initMasterBus(ctx);
           }
+
+          // Resume if suspended (iOS WebKit requirement on user action)
           if (ctx.state === 'suspended') {
-            ctx.resume();
+            log('AUDIO-RESUME', 'Context suspended, triggering resume()...');
+            var p = ctx.resume();
+            if (p && typeof p.then === 'function') {
+              p.then(function() {
+                log('AUDIO-RESUME', 'resume() promise resolved successfully. State: ' + ctx.state);
+              }).catch(function(err) {
+                log('AUDIO-RESUME-ERR', 'resume() rejected: ' + err.message);
+              });
+            }
           }
+
+          // Force hardware buffer unlock on first gesture
+          unlockIOSAudio(ctx);
+
           return ctx;
         }
 
-        // Generates an acoustic impulse response for mountain valley reverb with smooth fade-in and decay
-        function createReverbImpulse(c, duration, decay) {
-          var rate = c.sampleRate;
-          var length = Math.floor(rate * duration);
-          var impulse = c.createBuffer(2, length, rate);
-          var left = impulse.getChannelData(0);
-          var right = impulse.getChannelData(1);
-          var attackLen = Math.floor(rate * 0.012); // 12ms smooth attack window prevents transient click
-          for (var i = 0; i < length; i++) {
-            var t = i / rate;
-            var env = Math.exp(-t * decay);
-            var fadeIn = i < attackLen ? (i / attackLen) : 1.0;
-            left[i] = (Math.random() * 2 - 1) * env * fadeIn * 0.32;
-            right[i] = (Math.random() * 2 - 1) * env * fadeIn * 0.32;
+        function unlockIOSAudio(c) {
+          if (!c) return;
+          if (isAudioUnlocked && c.state === 'running') return;
+
+          log('AUDIO-UNLOCK', 'Attempting iOS WebKit audio graph unlock (state=' + c.state + ')');
+          try {
+            // Play 1 sample of silence directly to destination within user gesture
+            var buffer = c.createBuffer(1, 1, 22050);
+            var source = c.createBufferSource();
+            source.buffer = buffer;
+            source.connect(c.destination);
+            source.start(0);
+            isAudioUnlocked = true;
+            log('AUDIO-UNLOCK', 'Direct silent buffer triggered on c.destination');
+          } catch (e) {
+            log('AUDIO-UNLOCK-WARN', 'Failed playing unlock silent buffer: ' + e.message);
           }
-          return impulse;
+        }
+
+        // Generates an acoustic impulse response for mountain valley reverb
+        function createReverbImpulse(c, duration, decay) {
+          try {
+            var rate = c.sampleRate || 44100;
+            var length = Math.floor(rate * duration);
+            var impulse = c.createBuffer(2, length, rate);
+            var left = impulse.getChannelData(0);
+            var right = impulse.getChannelData(1);
+            var attackLen = Math.floor(rate * 0.012); // 12ms smooth attack window prevents transient click
+            for (var i = 0; i < length; i++) {
+              var t = i / rate;
+              var env = Math.exp(-t * decay);
+              var fadeIn = i < attackLen ? (i / attackLen) : 1.0;
+              left[i] = (Math.random() * 2 - 1) * env * fadeIn * 0.32;
+              right[i] = (Math.random() * 2 - 1) * env * fadeIn * 0.32;
+            }
+            return impulse;
+          } catch (e) {
+            log('REVERB-ERR', 'createReverbImpulse failed: ' + e.message);
+            return null;
+          }
         }
 
         // Master spatial audio bus with brickwall limiter, dry, toned-down valley reverb, and filtered slapback echo
         function initMasterBus(c) {
           if (masterBus) return;
-
-          // Master Dynamics Compressor / Limiter to completely prevent clipping pops and overload glitches
-          var limiter = c.createDynamicsCompressor();
-          limiter.threshold.setValueAtTime(-2.0, c.currentTime);
-          limiter.knee.setValueAtTime(3.0, c.currentTime);
-          limiter.ratio.setValueAtTime(20.0, c.currentTime);
-          limiter.attack.setValueAtTime(0.001, c.currentTime);
-          limiter.release.setValueAtTime(0.05, c.currentTime);
-          limiter.connect(c.destination);
-
-          masterBus = c.createGain();
-          masterBus.gain.setValueAtTime(0.85, c.currentTime);
-
-          // 1. Dry path (crisp, present, and clear)
-          var dryGain = c.createGain();
-          dryGain.gain.setValueAtTime(0.74, c.currentTime);
-          masterBus.connect(dryGain);
-          dryGain.connect(limiter);
-
-          // 2. Valley Reverb path (toned down slightly for subtle mountain depth)
+          log('BUS', 'Initializing master audio bus...');
           try {
-            var revBuf = createReverbImpulse(c, 1.8, 3.0);
-            var convolver = c.createConvolver();
-            convolver.buffer = revBuf;
-            var revGain = c.createGain();
-            revGain.gain.setValueAtTime(0.12, c.currentTime);
-            masterBus.connect(convolver);
-            convolver.connect(revGain);
-            revGain.connect(limiter);
-          } catch(e){}
+            // Master Dynamics Compressor / Limiter
+            var limiter = c.createDynamicsCompressor();
+            limiter.threshold.setValueAtTime(-2.0, c.currentTime);
+            limiter.knee.setValueAtTime(3.0, c.currentTime);
+            limiter.ratio.setValueAtTime(20.0, c.currentTime);
+            limiter.attack.setValueAtTime(0.001, c.currentTime);
+            limiter.release.setValueAtTime(0.05, c.currentTime);
+            limiter.connect(c.destination);
 
-          // 3. Valley Slapback Echo path (toned down, gentle natural reflection)
-          try {
-            var echoDelay = c.createDelay();
-            echoDelay.delayTime.setValueAtTime(0.22, c.currentTime); // 220ms echo
+            masterBus = c.createGain();
+            masterBus.gain.setValueAtTime(0.85, c.currentTime);
 
-            var echoFeedback = c.createGain();
-            echoFeedback.gain.setValueAtTime(0.18, c.currentTime);
+            // 1. Dry path
+            var dryGain = c.createGain();
+            dryGain.gain.setValueAtTime(0.74, c.currentTime);
+            masterBus.connect(dryGain);
+            dryGain.connect(limiter);
 
-            var echoFilter = c.createBiquadFilter();
-            echoFilter.type = 'bandpass';
-            echoFilter.frequency.setValueAtTime(1100, c.currentTime); // warm mountain reflection
-            echoFilter.Q.setValueAtTime(0.9, c.currentTime);
+            // 2. Valley Reverb path
+            try {
+              var revBuf = createReverbImpulse(c, 1.8, 3.0);
+              if (revBuf) {
+                var convolver = c.createConvolver();
+                convolver.buffer = revBuf;
+                var revGain = c.createGain();
+                revGain.gain.setValueAtTime(0.12, c.currentTime);
+                masterBus.connect(convolver);
+                convolver.connect(revGain);
+                revGain.connect(limiter);
+              }
+            } catch (e) {
+              log('BUS-WARN', 'Convolver setup exception: ' + e.message);
+            }
 
-            var echoGain = c.createGain();
-            echoGain.gain.setValueAtTime(0.10, c.currentTime);
+            // 3. Valley Slapback Echo path
+            try {
+              var echoDelay = c.createDelay();
+              echoDelay.delayTime.setValueAtTime(0.22, c.currentTime);
+              var echoFeedback = c.createGain();
+              echoFeedback.gain.setValueAtTime(0.18, c.currentTime);
+              var echoFilter = c.createBiquadFilter();
+              echoFilter.type = 'bandpass';
+              echoFilter.frequency.setValueAtTime(1100, c.currentTime);
+              echoFilter.Q.setValueAtTime(0.9, c.currentTime);
+              var echoGain = c.createGain();
+              echoGain.gain.setValueAtTime(0.10, c.currentTime);
 
-            masterBus.connect(echoDelay);
-            echoDelay.connect(echoFilter);
-            echoFilter.connect(echoFeedback);
-            echoFeedback.connect(echoDelay);
-            echoDelay.connect(echoGain);
-            echoGain.connect(limiter);
-          } catch(e){}
+              masterBus.connect(echoDelay);
+              echoDelay.connect(echoFilter);
+              echoFilter.connect(echoFeedback);
+              echoFeedback.connect(echoDelay);
+              echoDelay.connect(echoGain);
+              echoGain.connect(limiter);
+            } catch (e) {
+              log('BUS-WARN', 'Echo delay setup exception: ' + e.message);
+            }
+
+            log('BUS', 'Master audio bus initialized successfully.');
+          } catch (err) {
+            log('BUS-FATAL', 'initMasterBus failed: ' + err.message);
+          }
         }
 
         function createNoise(duration) {
           var c = getAudioCtx();
+          if (!c) return null;
           var len = Math.floor(c.sampleRate * (duration || 1));
           var buf = c.createBuffer(1, len, c.sampleRate);
           var d = buf.getChannelData(0);
@@ -319,355 +461,443 @@
           return curve;
         }
 
-        function triggerAirRelease(time) {
-          var c = getAudioCtx();
-          var buf = createNoise(0.08);
-          if (!buf) return;
-          var src = c.createBufferSource();
-          src.buffer = buf;
-          var filter = c.createBiquadFilter();
-          filter.type = 'bandpass';
-          filter.frequency.setValueAtTime(2200, time);
-          filter.Q.setValueAtTime(1.0, time);
-          var gain = c.createGain();
-          gain.gain.setValueAtTime(0.0001, time);
-          gain.gain.linearRampToValueAtTime(0.04, time + 0.008);
-          gain.gain.exponentialRampToValueAtTime(0.001, time + 0.08);
-          src.connect(filter);
-          filter.connect(gain);
-          if (masterBus) gain.connect(masterBus);
-          src.start(time);
-          src.stop(time + 0.09);
-        }
-
-        // Valve onset mechanical impulse (pneumatic pressure transient)
+        // Mechanical pneumatic valve click transient
         function triggerValveThump(time) {
           var c = getAudioCtx();
-          var osc = c.createOscillator();
-          var g = c.createGain();
-          osc.type = 'sine';
-          // 10,000-iteration global-optimum calibrated valve crack / pop transient:
-          // Pitch sweep from 144.6 Hz down to 38 Hz over 18ms
-          osc.frequency.setValueAtTime(144.57, time);
-          osc.frequency.exponentialRampToValueAtTime(38, time + 0.018);
-          // Crisp acoustic valve crack reaching 0.307 gain, decaying in 20ms
-          g.gain.setValueAtTime(0.307, time);
-          g.gain.exponentialRampToValueAtTime(0.001, time + 0.020);
-          osc.connect(g);
-          if (masterBus) g.connect(masterBus);
-          osc.start(time);
-          osc.stop(time + 0.022);
-        }
-
-        function triggerAirRelease(time) {
-          var c = getAudioCtx();
-          var buf = createNoise(0.14);
-          if (!buf) return;
-          var src = c.createBufferSource();
-          src.buffer = buf;
-          var filter = c.createBiquadFilter();
-          filter.type = 'bandpass';
-          filter.frequency.setValueAtTime(2040, time);
-          filter.Q.setValueAtTime(1.2, time);
-          var gain = c.createGain();
-          gain.gain.setValueAtTime(0.0001, time);
-          gain.gain.linearRampToValueAtTime(0.052, time + 0.015);
-          gain.gain.exponentialRampToValueAtTime(0.001, time + 0.12);
-          src.connect(filter);
-          filter.connect(gain);
-          if (masterBus) gain.connect(masterBus);
-          src.start(time);
-          src.stop(time + 0.14);
-        }
-
-        function startHorn() {
-          if (hornActive) return;
-          var c = getAudioCtx();
-          hornActive = true;
-          hornStart = c.currentTime;
-          var now = c.currentTime;
-
-          var master = c.createGain();
-          hornGain = master;
-          master.connect(masterBus);
-
-          // 10,000-iteration global-optimum calibrated attack & sustain profile (Loss: 13.396):
-          // Attack: 0.093s energetic onset rising smoothly to 0.696 gain
-          // Sustain: settles over 0.30s to whistle sustain (0.158 volume)
-          var rampTime = 0.093;
-          master.gain.setValueAtTime(0.18, now);
-          master.gain.linearRampToValueAtTime(0.696, now + rampTime);
-          master.gain.exponentialRampToValueAtTime(0.158, now + rampTime + 0.30);
-
-          // Valve crack transient
-          triggerValveThump(now);
-
-          // 10,000-iteration calibrated flute/whistle harmonic pipes:
-          // Pure sine + warm triangle oscillators without harsh sawtooth clipping
-          // Ab augmented chord: [1286.24 Hz, 1038.48 Hz, 846.25 Hz] + 1109.24 Hz air lock + 644.40 Hz body chamber
-          var chimes = [
-            // High chime (1286.24 Hz) - sweet upper overtone, fast release (0.140s, 4.0% pitch relax)
-            { f: 1286.24, type: 'sine',     v: 0.138, detune: -1.5, release: 0.140, pDrop: 0.040 },
-            { f: 1286.24, type: 'triangle', v: 0.086, detune: 0,    release: 0.140, pDrop: 0.040 },
-            { f: 2572.48, type: 'sine',     v: 0.202, detune: -1.5, release: 0.135, pDrop: 0.035 }, // 2nd harmonic
-
-            // Mid chime (1038.48 Hz) - flute tone, fast release (0.126s, 2.6% pitch relax)
-            { f: 1038.48, type: 'sine',     v: 0.050, detune: 1.0,  release: 0.126, pDrop: 0.026 },
-            { f: 1038.48, type: 'triangle', v: 0.215, detune: 0,    release: 0.126, pDrop: 0.026 },
-            { f: 2076.96, type: 'sine',     v: 0.106, detune: 1.0,  release: 0.120, pDrop: 0.024 }, // 2nd harmonic
-            { f: 3115.44, type: 'sine',     v: 0.117, detune: 1.0,  release: 0.115, pDrop: 0.022 }, // 3rd harmonic
-
-            // Root fundamental pipe (846.25 Hz) - dominant whistle body, longest release (0.450s, 4.9% pitch relax)
-            { f: 846.25,  type: 'sine',     v: 0.050, detune: -1.0, release: 0.450, pDrop: 0.049 },
-            { f: 846.25,  type: 'triangle', v: 0.116, detune: 0,    release: 0.450, pDrop: 0.049 },
-            { f: 1692.50, type: 'sine',     v: 0.188, detune: 0,    release: 0.380, pDrop: 0.045 }, // 2nd harmonic
-            { f: 2538.75, type: 'sine',     v: 0.026, detune: 0,    release: 0.320, pDrop: 0.040 }, // 3rd harmonic
-
-            // Whistle mouth air-lock (1109.24 Hz) - stabilizing resonance (0.318s release, 1.6% pitch relax)
-            { f: 1109.24, type: 'sine',     v: 0.128, detune: 0,    release: 0.318, pDrop: 0.016 },
-            { f: 1109.24, type: 'triangle', v: 0.289, detune: 0,    release: 0.318, pDrop: 0.016 },
-            { f: 2218.48, type: 'sine',     v: 0.177, detune: 0,    release: 0.290, pDrop: 0.015 }, // 2nd harmonic
-            { f: 3327.72, type: 'sine',     v: 0.039, detune: 0,    release: 0.240, pDrop: 0.014 }, // 3rd harmonic
-
-            // Resonant chamber (644.40 Hz) - rounded hollow undertone sustaining through release (0.450s release, 3.4% pitch relax)
-            { f: 644.40,  type: 'sine',     v: 0.050, detune: 0,    release: 0.450, pDrop: 0.034 },
-            { f: 644.40,  type: 'triangle', v: 0.255, detune: 0,    release: 0.450, pDrop: 0.034 },
-            { f: 1288.80, type: 'sine',     v: 0.179, detune: 0,    release: 0.380, pDrop: 0.030 },
-            { f: 1933.20, type: 'sine',     v: 0.123, detune: 0,    release: 0.320, pDrop: 0.028 }
-          ];
-
-          // Calibrated dynamic acoustic body lowpass: opens from 1100 Hz to 2040 Hz over attack ramp
-          var filter = c.createBiquadFilter();
-          filter.type = 'lowpass';
-          filter.frequency.setValueAtTime(1100, now);
-          filter.frequency.exponentialRampToValueAtTime(2040, now + rampTime);
-          filter.Q.setValueAtTime(1.1, now);
-
-          // Bronze whistle formant peak at 1695 Hz
-          var formant = c.createBiquadFilter();
-          formant.type = 'peaking';
-          formant.frequency.setValueAtTime(1695, now);
-          formant.gain.setValueAtTime(3.2, now);
-          formant.Q.setValueAtTime(1.8, now);
-
-          // Clean audio path without clipping distortion
-          filter.connect(formant);
-          formant.connect(master);
-
-          // Pneumatic manifold flutter (subtle 5.2 Hz pressure turbulence)
-          var airFlutter = c.createOscillator();
-          airFlutter.type = 'sine';
-          airFlutter.frequency.setValueAtTime(5.2, now);
-          var airFlutterGain = c.createGain();
-          airFlutterGain.gain.setValueAtTime(2.5, now);
-          airFlutter.connect(airFlutterGain);
-          airFlutter.start(now);
-
-          var pipes = [];
-          chimes.forEach(function(p) {
-            var osc = c.createOscillator();
-            var g = c.createGain();
-            osc.type = p.type;
-            // Horn starts with subtle pressure rise (0.982x) locking into resonant pitch in 0.093s
-            var startF = p.f * 0.982;
-            osc.frequency.setValueAtTime(startF, now);
-            osc.frequency.exponentialRampToValueAtTime(p.f, now + rampTime);
-            osc.detune.setValueAtTime(p.detune, now);
-            airFlutterGain.connect(osc.detune);
-            g.gain.setValueAtTime(p.v, now);
-            osc.connect(g);
-            g.connect(filter);
-            osc.start(now);
-            pipes.push({ osc: osc, gain: g, release: p.release, f: p.f, pDrop: p.pDrop });
-          });
-
-          // Breathy air rushing through whistle mouth
-          var noise = c.createBufferSource();
-          noise.buffer = createNoise(1.0);
-          noise.loop = true;
-          var nF = c.createBiquadFilter();
-          nF.type = 'bandpass';
-          nF.frequency.setValueAtTime(2200, now);
-          nF.Q.setValueAtTime(1.3, now);
-          var nG = c.createGain();
-          nG.gain.setValueAtTime(0.001, now);
-          nG.gain.linearRampToValueAtTime(0.025, now + rampTime);
-          noise.connect(nF);
-          nF.connect(nG);
-          nG.connect(master);
-          noise.start(now);
-
-          hornNodes = { pipes: pipes, noise: noise, filter: filter, airFlutter: airFlutter, nG: nG };
-        }
-
-        function stopHorn() {
-          if (!hornActive) return;
-          hornActive = false;
-          var c = getAudioCtx();
-          var now = c.currentTime;
-
-          // 10,000-iteration global-optimum calibrated release falloff (Loss: 13.396):
-          // 1. Pneumatic release surge: air valve venting causes manifold pressure surge
-          //    peaking at surgeDelay (0.192s) with 0.512 volume, then decaying cleanly into silence.
-          // 2. Calibrated tiered pipe dropouts:
-          //    - Mid chime (1038 Hz): drops first (0.126s, 2.6% pitch drop)
-          //    - High chime (1286 Hz): drops second (0.140s, 4.0% pitch drop)
-          //    - Air lock (1109 Hz): sustains to 0.318s (1.6% pitch drop)
-          //    - Resonant chamber (644 Hz): sustains to 0.450s (3.4% pitch drop)
-          //    - Root fundamental (846 Hz): sustains longest to 0.450s (4.9% pitch drop)
-          // 3. Acoustic body lowpass sweep: tracks downward from 2040 Hz to 580 Hz, rolling off high harmonics
-          var surgePeakDelay = 0.192;
-          var surgeGain = 0.512;
-          var maxRelease = 0.450;
-
-          // Filter gracefully tracks down as higher pipes cut out
-          if (hornNodes && hornNodes.filter) {
-            try {
-              var curCutoff = hornNodes.filter.frequency.value;
-              hornNodes.filter.frequency.cancelScheduledValues(now);
-              hornNodes.filter.frequency.setValueAtTime(curCutoff, now);
-              hornNodes.filter.frequency.exponentialRampToValueAtTime(580, now + maxRelease);
-            } catch(e){}
-          }
-
-          // Individual pipe staggered dropouts and pressure relax pitch bend
-          if (hornNodes && hornNodes.pipes) {
-            hornNodes.pipes.forEach(function(p) {
-              try {
-                var dropRatio = 1.0 - (p.pDrop || 0.04);
-                p.osc.frequency.cancelScheduledValues(now);
-                p.osc.frequency.setValueAtTime(p.osc.frequency.value, now);
-                p.osc.frequency.exponentialRampToValueAtTime(Math.max(30, p.f * dropRatio), now + p.release);
-
-                p.gain.gain.cancelScheduledValues(now);
-                p.gain.gain.setValueAtTime(p.gain.gain.value, now);
-                p.gain.gain.exponentialRampToValueAtTime(0.0001, now + p.release);
-                p.osc.stop(now + p.release + 0.04);
-              } catch(e){}
-            });
-          }
-
-          // Master volume surge and falloff
-          if (hornGain) {
-            hornGain.gain.cancelScheduledValues(now);
-            var curGain = hornGain.gain.value;
-            hornGain.gain.setValueAtTime(curGain, now);
-            // Pneumatic release puff: rises to surgeGain in surgePeakDelay
-            hornGain.gain.linearRampToValueAtTime(surgeGain, now + surgePeakDelay);
-            // Clean exponential falloff into silence over maxRelease
-            hornGain.gain.exponentialRampToValueAtTime(0.0001, now + maxRelease);
-          }
-
-          // Air noise dies out as valve shuts
-          if (hornNodes && hornNodes.nG) {
-            try {
-              hornNodes.nG.gain.cancelScheduledValues(now);
-              hornNodes.nG.gain.setValueAtTime(hornNodes.nG.gain.value, now);
-              hornNodes.nG.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
-            } catch(e){}
-          }
-
-          triggerAirRelease(now);
-
-          var nodes = hornNodes;
-          setTimeout(function() {
-            if (nodes) {
-              if (nodes.pipes) {
-                nodes.pipes.forEach(function(p) {
-                  try { p.osc.disconnect(); p.gain.disconnect(); } catch(e){}
-                });
-              }
-              if (nodes.noise) { try { nodes.noise.stop(); nodes.noise.disconnect(); } catch(e){} }
-              if (nodes.airFlutter) { try { nodes.airFlutter.stop(); nodes.airFlutter.disconnect(); } catch(e){} }
-            }
-          }, (maxRelease + 0.1) * 1000);
-
-          hornNodes = null;
-          hornGain = null;
-        }
-
-        function strikeBell() {
-          var c = getAudioCtx();
-          var now = c.currentTime;
-          bellStrikeCount++;
-
-          // Calibrated to 1700.0 Hz (higher than 1650 Hz, but below 1760 Hz, matching the uploaded bell audio)
-          var baseF = 1700.0;
-
-          // Double the wobble frequency (20.4 Hz) for rapid shimmering metallic flutter
-          var wLfo = c.createOscillator();
-          wLfo.type = 'sine';
-          wLfo.frequency.setValueAtTime(20.4, now);
-          var wGain = c.createGain();
-          wGain.gain.setValueAtTime(14.0, now);
-          wGain.gain.exponentialRampToValueAtTime(2.5, now + 1.8);
-          wLfo.connect(wGain);
-          wLfo.start(now);
-          wLfo.stop(now + 2.2);
-
-          // Well-balanced partial gains preventing internal audio clipping
-          var partials = [
-            { f: baseF, g: 0.34, d: 2.0, dt: 0 },
-            { f: baseF * 1.0025, g: 0.24, d: 1.7, dt: 2 },
-            { f: baseF * 1.189, g: 0.18, d: 1.3, dt: -3 },
-            { f: baseF * 1.5, g: 0.14, d: 1.0, dt: 4 },
-            { f: baseF * 2.0, g: 0.10, d: 0.7, dt: 2 },
-            { f: baseF * 2.756, g: 0.06, d: 0.5, dt: -3 },
-            { f: baseF * 0.5, g: 0.15, d: 2.1, dt: 0 }
-          ];
-
-          var bellMaster = c.createGain();
-          bellMaster.gain.setValueAtTime(0.70, now);
-          bellMaster.connect(masterBus);
-
-          partials.forEach(function(p) {
+          if (!c) return;
+          try {
             var osc = c.createOscillator();
             var g = c.createGain();
             osc.type = 'sine';
-            osc.frequency.setValueAtTime(p.f, now);
-            osc.detune.setValueAtTime(p.dt, now);
-            wGain.connect(osc.detune);
-
-            g.gain.setValueAtTime(p.g, now);
-            g.gain.exponentialRampToValueAtTime(0.0001, now + p.d);
+            osc.frequency.setValueAtTime(144.57, time);
+            osc.frequency.exponentialRampToValueAtTime(38, time + 0.018);
+            g.gain.setValueAtTime(0.307, time);
+            g.gain.exponentialRampToValueAtTime(0.001, time + 0.020);
             osc.connect(g);
-            g.connect(bellMaster);
-            osc.start(now);
-            osc.stop(now + p.d);
-          });
+            if (masterBus) g.connect(masterBus);
+            osc.start(time);
+            osc.stop(time + 0.022);
+          } catch (e) {
+            log('HORN-WARN', 'triggerValveThump error: ' + e.message);
+          }
+        }
 
-          // Softened clapper strike click transient to eliminate pop/click artifacts
-          var src = c.createBufferSource();
-          src.buffer = createNoise(0.025);
-          var filter = c.createBiquadFilter();
-          filter.type = 'highpass';
-          filter.frequency.setValueAtTime(4500, now);
-          var sG = c.createGain();
-          sG.gain.setValueAtTime(0.0001, now);
-          sG.gain.linearRampToValueAtTime(0.12, now + 0.002);
-          sG.gain.exponentialRampToValueAtTime(0.0001, now + 0.025);
-          src.connect(filter);
-          filter.connect(sG);
-          sG.connect(bellMaster);
-          src.start(now);
-          src.stop(now + 0.03);
+        function triggerAirRelease(time) {
+          var c = getAudioCtx();
+          if (!c) return;
+          try {
+            var buf = createNoise(0.14);
+            if (!buf) return;
+            var src = c.createBufferSource();
+            src.buffer = buf;
+            var filter = c.createBiquadFilter();
+            filter.type = 'bandpass';
+            filter.frequency.setValueAtTime(2040, time);
+            filter.Q.setValueAtTime(1.2, time);
+            var gain = c.createGain();
+            gain.gain.setValueAtTime(0.0001, time);
+            gain.gain.linearRampToValueAtTime(0.052, time + 0.015);
+            gain.gain.exponentialRampToValueAtTime(0.001, time + 0.12);
+            src.connect(filter);
+            filter.connect(gain);
+            if (masterBus) gain.connect(masterBus);
+            src.start(time);
+            src.stop(time + 0.14);
+          } catch (e) {
+            log('HORN-WARN', 'triggerAirRelease error: ' + e.message);
+          }
+        }
+
+        function startHorn() {
+          log('HORN', 'startHorn() requested. Current hornActive: ' + hornActive);
+          if (hornActive) return;
+          var c = getAudioCtx();
+          if (!c) {
+            log('HORN-FATAL', 'startHorn aborted: AudioContext is null');
+            return;
+          }
+
+          hornActive = true;
+          log('HORN', 'startHorn active. Context state: ' + c.state + ', currentTime: ' + c.currentTime);
+          
+          try {
+            hornStart = c.currentTime;
+            var now = c.currentTime;
+
+            var master = c.createGain();
+            hornGain = master;
+            master.connect(masterBus);
+
+            var rampTime = 0.093;
+            master.gain.setValueAtTime(0.18, now);
+            master.gain.linearRampToValueAtTime(0.696, now + rampTime);
+            master.gain.exponentialRampToValueAtTime(0.158, now + rampTime + 0.30);
+
+            triggerValveThump(now);
+
+            // Calibrated flute/whistle harmonic pipes:
+            var chimes = [
+              // High chime (1286.24 Hz)
+              { f: 1286.24, type: 'sine',     v: 0.138, detune: -1.5, release: 0.140, pDrop: 0.040 },
+              { f: 1286.24, type: 'triangle', v: 0.086, detune: 0,    release: 0.140, pDrop: 0.040 },
+              { f: 2572.48, type: 'sine',     v: 0.202, detune: -1.5, release: 0.135, pDrop: 0.035 },
+              // Mid chime (1038.48 Hz)
+              { f: 1038.48, type: 'sine',     v: 0.050, detune: 1.0,  release: 0.126, pDrop: 0.026 },
+              { f: 1038.48, type: 'triangle', v: 0.215, detune: 0,    release: 0.126, pDrop: 0.026 },
+              { f: 2076.96, type: 'sine',     v: 0.106, detune: 1.0,  release: 0.120, pDrop: 0.024 },
+              { f: 3115.44, type: 'sine',     v: 0.117, detune: 1.0,  release: 0.115, pDrop: 0.022 },
+              // Root fundamental pipe (846.25 Hz)
+              { f: 846.25,  type: 'sine',     v: 0.236, detune: 0,    release: 0.450, pDrop: 0.049 },
+              { f: 846.25,  type: 'triangle', v: 0.174, detune: 0,    release: 0.450, pDrop: 0.049 },
+              { f: 1692.50, type: 'sine',     v: 0.142, detune: 0,    release: 0.380, pDrop: 0.045 },
+              { f: 2538.75, type: 'sine',     v: 0.091, detune: 0,    release: 0.320, pDrop: 0.040 },
+              // Whistle mouth air lock stabilizing resonance (1109.24 Hz)
+              { f: 1109.24, type: 'sine',     v: 0.120, detune: 2.0,  release: 0.318, pDrop: 0.016 },
+              { f: 1109.24, type: 'triangle', v: 0.065, detune: 0,    release: 0.318, pDrop: 0.016 },
+              // Hollow lower body cavity resonance (644.40 Hz)
+              { f: 644.40,  type: 'sine',     v: 0.180, detune: -2.0, release: 0.450, pDrop: 0.034 },
+              { f: 644.40,  type: 'triangle', v: 0.095, detune: 0,    release: 0.450, pDrop: 0.034 }
+            ];
+
+            var pipeInstances = [];
+
+            // Whistle acoustic body filter (2040 Hz cutoff)
+            var acousticFilter = c.createBiquadFilter();
+            acousticFilter.type = 'lowpass';
+            acousticFilter.frequency.setValueAtTime(2040, now);
+            acousticFilter.Q.setValueAtTime(0.707, now);
+            acousticFilter.connect(master);
+
+            chimes.forEach(function(chime) {
+              var osc = c.createOscillator();
+              var gain = c.createGain();
+              osc.type = chime.type;
+              osc.frequency.setValueAtTime(chime.f, now);
+              osc.detune.setValueAtTime(chime.detune, now);
+              gain.gain.setValueAtTime(chime.v, now);
+
+              osc.connect(gain);
+              gain.connect(acousticFilter);
+              osc.start(now);
+
+              pipeInstances.push({
+                osc: osc,
+                gain: gain,
+                f: chime.f,
+                v: chime.v,
+                release: chime.release,
+                pDrop: chime.pDrop
+              });
+            });
+
+            // Gentle aerated breath hiss
+            var airHissBuf = createNoise(4.0);
+            var airHiss = c.createBufferSource();
+            airHiss.buffer = airHissBuf;
+            airHiss.loop = true;
+
+            var noiseFilter = c.createBiquadFilter();
+            noiseFilter.type = 'bandpass';
+            noiseFilter.frequency.setValueAtTime(1450, now);
+            noiseFilter.Q.setValueAtTime(1.4, now);
+
+            var noiseGain = c.createGain();
+            noiseGain.gain.setValueAtTime(0.0001, now);
+            noiseGain.gain.linearRampToValueAtTime(0.018, now + 0.05);
+
+            airHiss.connect(noiseFilter);
+            noiseFilter.connect(noiseGain);
+            noiseGain.connect(master);
+            airHiss.start(now);
+
+            // Aerodynamic air modulation LFO (7.8 Hz)
+            var flutterLfo = c.createOscillator();
+            flutterLfo.frequency.setValueAtTime(7.8, now);
+            var flutterGain = c.createGain();
+            flutterGain.gain.setValueAtTime(0.035, now);
+            flutterLfo.connect(flutterGain);
+            flutterGain.connect(master.gain);
+            flutterLfo.start(now);
+
+            hornNodes = {
+              pipes: pipeInstances,
+              noise: airHiss,
+              nG: noiseGain,
+              airFlutter: flutterLfo,
+              fG: flutterGain
+            };
+            log('HORN', 'Pipes and oscillators started successfully (' + pipeInstances.length + ' pipes)');
+          } catch (e) {
+            log('HORN-ERR', 'Error starting horn: ' + e.message);
+          }
+        }
+
+        function stopHorn() {
+          log('HORN', 'stopHorn() called. hornActive: ' + hornActive);
+          if (!hornActive) return;
+          hornActive = false;
+          var c = getAudioCtx();
+          if (!c) return;
+
+          try {
+            var now = c.currentTime;
+            var surgePeakDelay = 0.192;
+            var surgeGain = 0.512;
+            var maxRelease = 0.450;
+
+            if (hornNodes && hornNodes.fG) {
+              try {
+                hornNodes.fG.gain.cancelScheduledValues(now);
+                hornNodes.fG.gain.setValueAtTime(hornNodes.fG.gain.value, now);
+                hornNodes.fG.gain.linearRampToValueAtTime(0, now + 0.04);
+              } catch (e) {}
+            }
+
+            // Pipe staggered dropouts and pressure pitch drop
+            if (hornNodes && hornNodes.pipes) {
+              hornNodes.pipes.forEach(function(p) {
+                try {
+                  var dropRatio = 1.0 - (p.pDrop || 0.04);
+                  p.osc.frequency.cancelScheduledValues(now);
+                  p.osc.frequency.setValueAtTime(p.osc.frequency.value, now);
+                  p.osc.frequency.exponentialRampToValueAtTime(Math.max(30, p.f * dropRatio), now + p.release);
+                  p.gain.gain.cancelScheduledValues(now);
+                  p.gain.gain.setValueAtTime(p.gain.gain.value, now);
+                  p.gain.gain.exponentialRampToValueAtTime(0.0001, now + p.release);
+                  p.osc.stop(now + p.release + 0.04);
+                } catch (e) {}
+              });
+            }
+
+            // Master volume surge and falloff
+            if (hornGain) {
+              hornGain.gain.cancelScheduledValues(now);
+              var curGain = hornGain.gain.value;
+              hornGain.gain.setValueAtTime(curGain, now);
+              hornGain.gain.linearRampToValueAtTime(surgeGain, now + surgePeakDelay);
+              hornGain.gain.exponentialRampToValueAtTime(0.0001, now + maxRelease);
+            }
+
+            if (hornNodes && hornNodes.nG) {
+              try {
+                hornNodes.nG.gain.cancelScheduledValues(now);
+                hornNodes.nG.gain.setValueAtTime(hornNodes.nG.gain.value, now);
+                hornNodes.nG.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
+              } catch (e) {}
+            }
+
+            triggerAirRelease(now);
+
+            var nodes = hornNodes;
+            setTimeout(function() {
+              if (nodes) {
+                if (nodes.pipes) {
+                  nodes.pipes.forEach(function(p) {
+                    try { p.osc.disconnect(); p.gain.disconnect(); } catch (e) {}
+                  });
+                }
+                if (nodes.noise) { try { nodes.noise.stop(); nodes.noise.disconnect(); } catch (e) {} }
+                if (nodes.airFlutter) { try { nodes.airFlutter.stop(); nodes.airFlutter.disconnect(); } catch (e) {} }
+              }
+            }, (maxRelease + 0.1) * 1000);
+
+            hornNodes = null;
+            hornGain = null;
+            log('HORN', 'stopHorn release envelopes scheduled.');
+          } catch (e) {
+            log('HORN-ERR', 'stopHorn error: ' + e.message);
+          }
+        }
+
+        function strikeBell() {
+          log('BELL', 'strikeBell() called');
+          var c = getAudioCtx();
+          if (!c) {
+            log('BELL-FATAL', 'strikeBell aborted: AudioContext is null');
+            return;
+          }
+
+          try {
+            var now = c.currentTime;
+            bellStrikeCount++;
+
+            var baseF = 1700.0;
+            var wLfo = c.createOscillator();
+            wLfo.type = 'sine';
+            wLfo.frequency.setValueAtTime(20.4, now);
+            var wGain = c.createGain();
+            wGain.gain.setValueAtTime(14.0, now);
+            wGain.gain.exponentialRampToValueAtTime(2.5, now + 1.8);
+            wLfo.connect(wGain);
+            wLfo.start(now);
+            wLfo.stop(now + 2.2);
+
+            var partials = [
+              { f: baseF, g: 0.34, d: 2.0, dt: 0 },
+              { f: baseF * 1.0025, g: 0.24, d: 1.7, dt: 2 },
+              { f: baseF * 1.189, g: 0.18, d: 1.3, dt: -3 },
+              { f: baseF * 1.5, g: 0.14, d: 1.0, dt: 4 },
+              { f: baseF * 2.0, g: 0.10, d: 0.7, dt: 2 },
+              { f: baseF * 2.756, g: 0.06, d: 0.5, dt: -3 },
+              { f: baseF * 0.5, g: 0.15, d: 2.1, dt: 0 }
+            ];
+
+            var bellMaster = c.createGain();
+            bellMaster.gain.setValueAtTime(0.70, now);
+            bellMaster.connect(masterBus);
+
+            partials.forEach(function(p) {
+              var osc = c.createOscillator();
+              var g = c.createGain();
+              osc.type = 'sine';
+              osc.frequency.setValueAtTime(p.f, now);
+              osc.detune.setValueAtTime(p.dt, now);
+              wGain.connect(osc.detune);
+              g.gain.setValueAtTime(p.g, now);
+              g.gain.exponentialRampToValueAtTime(0.0001, now + p.d);
+              osc.connect(g);
+              g.connect(bellMaster);
+              osc.start(now);
+              osc.stop(now + p.d);
+            });
+
+            // Strike transient click
+            var src = c.createBufferSource();
+            src.buffer = createNoise(0.025);
+            var filter = c.createBiquadFilter();
+            filter.type = 'highpass';
+            filter.frequency.setValueAtTime(4500, now);
+            var sG = c.createGain();
+            sG.gain.setValueAtTime(0.0001, now);
+            sG.gain.linearRampToValueAtTime(0.12, now + 0.002);
+            sG.gain.exponentialRampToValueAtTime(0.0001, now + 0.025);
+            src.connect(filter);
+            filter.connect(sG);
+            sG.connect(bellMaster);
+            src.start(now);
+            src.stop(now + 0.03);
+
+            log('BELL', 'strikeBell scheduled with ' + partials.length + ' partials.');
+          } catch (e) {
+            log('BELL-ERR', 'strikeBell error: ' + e.message);
+          }
+        }
+
+        // --- Clipboard Diagnostics Copy Routine (Ladybug handler) ---
+        function copyDiagnosticsToClipboard() {
+          var header = '=== Big Walk Train Controls Diagnostic Report ===\n' +
+            'Timestamp: ' + new Date().toISOString() + '\n' +
+            'UserAgent: ' + navigator.userAgent + '\n' +
+            'AudioContext: ' + (ctx ? ('State=' + ctx.state + ', currentTime=' + ctx.currentTime + ', sampleRate=' + ctx.sampleRate) : 'Not instantiated') + '\n' +
+            'isAudioUnlocked: ' + isAudioUnlocked + '\n' +
+            'hornActive: ' + hornActive + '\n' +
+            'bellStrikeCount: ' + bellStrikeCount + '\n' +
+            'Log Entries (' + logHistory.length + '):\n' +
+            '----------------------------------------\n';
+
+          var fullLogText = header + logHistory.join('\n') + '\n========================================';
+
+          // Visual toast feedback
+          function showToast(msg, isSuccess) {
+            var banner = document.getElementById('log-toast-banner');
+            var bugToast = document.getElementById('ladybug-toast');
+            if (bugToast) bugToast.textContent = isSuccess ? 'COPIED!' : 'FAILED';
+            if (banner) {
+              banner.textContent = msg;
+              banner.style.background = isSuccess ? '#2e7d32' : '#c62828';
+              banner.style.opacity = '1';
+              banner.style.transform = 'translateX(-50%) translateY(4px)';
+              setTimeout(function() {
+                banner.style.opacity = '0';
+                banner.style.transform = 'translateX(-50%) translateY(0)';
+                if (bugToast) bugToast.textContent = 'LOGS';
+              }, 3000);
+            }
+          }
+
+          log('DIAG', 'Copy logs requested by user.');
+
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(fullLogText).then(function() {
+              log('DIAG', 'Logs successfully copied via navigator.clipboard');
+              showToast('Diagnostic logs copied to clipboard!', true);
+            }).catch(function(err) {
+              log('DIAG-WARN', 'navigator.clipboard.writeText failed: ' + err.message + ', attempting execCommand fallback');
+              fallbackCopy(fullLogText, showToast);
+            });
+          } else {
+            fallbackCopy(fullLogText, showToast);
+          }
+        }
+
+        function fallbackCopy(text, callback) {
+          try {
+            var textArea = document.createElement('textarea');
+            textArea.value = text;
+            textArea.style.position = 'fixed';
+            textArea.style.left = '-9999px';
+            textArea.style.top = '0';
+            document.body.appendChild(textArea);
+            textArea.focus();
+            textArea.select();
+            var success = document.execCommand('copy');
+            document.body.removeChild(textArea);
+            if (success) {
+              log('DIAG', 'Logs successfully copied via document.execCommand fallback');
+              callback('Diagnostic logs copied to clipboard!', true);
+            } else {
+              throw new Error('execCommand returned false');
+            }
+          } catch (e) {
+            log('DIAG-ERR', 'Clipboard fallback copy failed: ' + e.message);
+            callback('Could not auto-copy. See console logs.', false);
+          }
         }
 
         function bindEvents() {
+          log('EVENTS', 'Binding user control events...');
           var hBtn = document.getElementById('standalone-horn-btn');
           var bBtn = document.getElementById('standalone-bell-btn');
           var hDome = document.getElementById('standalone-horn-dome');
           var bDome = document.getElementById('standalone-bell-dome');
+          var ladybugBtn = document.getElementById('ladybug-log-btn');
           var bellActive = false;
 
-          if (!hBtn || !bBtn) return;
+          if (ladybugBtn) {
+            var onLadybugTap = function(e) {
+              if (e) {
+                e.preventDefault();
+                e.stopPropagation();
+              }
+              ladybugBtn.style.transform = 'scale(0.85) rotate(-10deg)';
+              setTimeout(function() {
+                ladybugBtn.style.transform = 'scale(1) rotate(0deg)';
+              }, 200);
+              copyDiagnosticsToClipboard();
+            };
+
+            ladybugBtn.addEventListener('touchstart', onLadybugTap, { passive: false });
+            ladybugBtn.addEventListener('click', onLadybugTap);
+            log('EVENTS', 'Ladybug button event bound');
+          }
+
+          if (!hBtn || !bBtn) {
+            log('EVENTS-WARN', 'Buttons not found: hBtn=' + !!hBtn + ', bBtn=' + !!bBtn);
+            return;
+          }
 
           window.addEventListener('contextmenu', function(e) {
             e.preventDefault();
           }, { passive: false });
 
+          // Audio pre-unlocker on any touch anywhere on document
+          document.addEventListener('touchstart', function() {
+            getAudioCtx();
+          }, { once: false, passive: true });
+
           function onHDown(e) {
             if (e) e.preventDefault();
+            log('TOUCH', 'onHDown event fired (type=' + (e ? e.type : 'none') + ')');
             startHorn();
             if (hBtn) hBtn.style.transform = 'translateY(6px) scale(0.94)';
             if (hDome) hDome.style.background = 'linear-gradient(to bottom, #8f2723, #ab312c, #6e1e1a)';
@@ -675,8 +905,10 @@
               try { navigator.vibrate(15); } catch (err) {}
             }
           }
+
           function onHUp(e) {
             if (e) e.preventDefault();
+            log('TOUCH', 'onHUp event fired (type=' + (e ? e.type : 'none') + ')');
             if (navigator.vibrate) {
               try { navigator.vibrate(0); } catch (err) {}
             }
@@ -687,6 +919,7 @@
 
           function onBDown(e) {
             if (e) e.preventDefault();
+            log('TOUCH', 'onBDown event fired (type=' + (e ? e.type : 'none') + ')');
             if (bellActive) return;
             bellActive = true;
             strikeBell();
@@ -696,8 +929,10 @@
               try { navigator.vibrate(15); } catch (err) {}
             }
           }
+
           function onBUp(e) {
             if (e) e.preventDefault();
+            log('TOUCH', 'onBUp event fired (type=' + (e ? e.type : 'none') + ')');
             if (navigator.vibrate) {
               try { navigator.vibrate(0); } catch (err) {}
             }
@@ -707,7 +942,7 @@
             if (bDome) bDome.style.background = 'linear-gradient(to bottom, #ffd766, #dfad32, #a87d1d)';
           }
 
-          // Non-passive touch listeners prevent Android 500ms long-press haptic impulse
+          // Touch listeners for mobile devices
           hBtn.addEventListener('touchstart', onHDown, { passive: false });
           hBtn.addEventListener('touchend', onHUp, { passive: false });
           hBtn.addEventListener('touchcancel', onHUp, { passive: false });
@@ -757,11 +992,14 @@
             if (k === 'arrowleft' || k === 'h' || k === 'z') onHDown(e);
             else if (k === 'arrowright' || k === 'b' || k === 'x') onBDown(e);
           });
+
           window.addEventListener('keyup', function(e) {
             var k = e.key.toLowerCase();
             if (k === 'arrowleft' || k === 'h' || k === 'z') onHUp(e);
             else if (k === 'arrowright' || k === 'b' || k === 'x') onBUp(e);
           });
+
+          log('EVENTS', 'All control listeners bound successfully.');
         }
 
         if (document.readyState === 'loading') {
