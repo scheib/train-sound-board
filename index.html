@@ -227,13 +227,57 @@
           </div>
         </div>
       </div>
-    </div>
 
-    <!-- Standalone self-contained audio engine with lush mountain reverb & valley echo -->
+    <!-- Isolated Sub-Sample Web Audio Engine (.mp4 AAC 256kbps @ 44.1kHz):
+         - Bell: Isolated bell_clean.mp4 (1.2500s) played on cue with polyphonic layering
+         - Horn: Decomposed into isolated horn_attack.mp4 (0.2200s), C^inf-periodic de-pulsed
+                 horn_sustain.mp4 (1.1000s), and monotonic horn_release.mp4 (0.3300s) -->
     <script>
       (function() {
+        var SAMPLE_RATE = 44100;
+        var HORN_ATTACK_SAMPLES = 9702;
+        var HORN_SUSTAIN_SAMPLES = 48510;
+        var HORN_RELEASE_SAMPLES = 14553;
+        var BELL_SAMPLES = 55125;
+
+        var AUDIO_FILES = {
+          bell: 'bell_clean.mp4',
+          hornAttack: 'horn_attack.mp4',
+          hornSustain: 'horn_sustain.mp4',
+          hornRelease: 'horn_release.mp4'
+        };
+
+        var PCM_DATA = {
+          ready: false,
+          bell: new Float32Array(BELL_SAMPLES),
+          hornAttack: new Float32Array(HORN_ATTACK_SAMPLES),
+          hornSustain: new Float32Array(HORN_SUSTAIN_SAMPLES),
+          hornRelease: new Float32Array(HORN_RELEASE_SAMPLES),
+          hornAttackSustain: new Float32Array(HORN_ATTACK_SAMPLES + HORN_SUSTAIN_SAMPLES)
+        };
+
+        // Pre-compute equal-power crossfade curves for Horn release transitions
+        var XFADE_CURVE_LEN = 256;
+        var FADE_OUT_CURVE = new Float32Array(XFADE_CURVE_LEN);
+        var FADE_IN_CURVE = new Float32Array(XFADE_CURVE_LEN);
+        for (var k = 0; k < XFADE_CURVE_LEN; k++) {
+          var theta = 0.5 * Math.PI * (k / (XFADE_CURVE_LEN - 1));
+          FADE_OUT_CURVE[k] = Math.cos(theta);
+          FADE_IN_CURVE[k] = Math.sin(theta);
+        }
+
         // --- Verbose Diagnostic In-Memory Logger ---
         var logHistory = [];
+        var glitchMetrics = {
+          discontinuitiesDetected: 0,
+          maxSampleStep: 0,
+          maxPeakLevel: 0,
+          activeVoiceCount: 0,
+          totalHornStarts: 0,
+          totalHornStops: 0,
+          totalBellStrikes: 0
+        };
+
         function log(category, message, data) {
           var now = new Date();
           var timeStr = now.toISOString().substring(11, 23);
@@ -253,7 +297,6 @@
           } catch (e) {}
         }
 
-        // Catch global unhandled errors
         window.addEventListener('error', function(e) {
           log('ERROR', 'Global window error: ' + (e.message || 'unknown'), {
             filename: e.filename,
@@ -266,538 +309,471 @@
           log('PROMISE-REJECT', 'Unhandled Promise: ' + (e.reason ? (e.reason.message || String(e.reason)) : 'unknown'));
         });
 
-        // Device environment info
         log('ENV', 'UserAgent: ' + navigator.userAgent);
         log('ENV', 'Platform: ' + navigator.platform + ', maxTouchPoints: ' + (navigator.maxTouchPoints || 0));
-        log('ENV', 'AudioContext Support: ' + (!!(window.AudioContext || window.webkitAudioContext)));
+        log('ENV', 'Model: Isolated Sub-Sample Engine (.mp4 AAC 256kbps)', {
+          sampleRate: SAMPLE_RATE,
+          files: AUDIO_FILES,
+          bellSec: Number((BELL_SAMPLES / SAMPLE_RATE).toFixed(4)),
+          hornAttackSec: Number((HORN_ATTACK_SAMPLES / SAMPLE_RATE).toFixed(4)),
+          hornSustainSec: Number((HORN_SUSTAIN_SAMPLES / SAMPLE_RATE).toFixed(4)),
+          hornReleaseSec: Number((HORN_RELEASE_SAMPLES / SAMPLE_RATE).toFixed(4))
+        });
 
         var ctx = null;
         var masterBus = null;
+        var liveBuffers = null;
         var isAudioUnlocked = false;
         var hornActive = false;
-        var hornStart = 0;
-        var hornNodes = null;
-        var hornGain = null;
+        var activeHornVoice = null;
+        var activeBellVoices = [];
         var bellStrikeCount = 0;
+        var mp4DecodePromise = null;
 
-        // --- iOS AudioContext & Buffer Unlocker ---
-        function getAudioCtx() {
-          if (!ctx) {
-            var Ctx = window.AudioContext || window.webkitAudioContext;
-            if (!Ctx) {
-              log('AUDIO-FATAL', 'AudioContext is NOT supported on this browser');
-              return null;
-            }
-            try {
-              // Try standard constructor with interactive latency
-              ctx = new Ctx({ latencyHint: 'interactive' });
-              log('AUDIO-INIT', 'Created AudioContext with latencyHint: interactive. State: ' + ctx.state);
-            } catch (e) {
-              log('AUDIO-WARN', 'Failed creating AudioContext with options, retrying without options: ' + e.message);
-              try {
-                ctx = new Ctx();
-                log('AUDIO-INIT', 'Created fallback AudioContext. State: ' + ctx.state);
-              } catch (err2) {
-                log('AUDIO-FATAL', 'Failed creating any AudioContext: ' + err2.message);
-                return null;
-              }
-            }
+        function ensureMp4Decoded() {
+          if (PCM_DATA.ready) return Promise.resolve(PCM_DATA);
+          if (mp4DecodePromise) return mp4DecodePromise;
+          var OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+          var decCtx = new OfflineCtx(1, 1, SAMPLE_RATE);
 
-            // Monitor context state transitions
-            if (ctx.onstatechange !== undefined) {
-              ctx.onstatechange = function() {
-                log('AUDIO-STATE', 'AudioContext state changed to: ' + ctx.state + ', currentTime: ' + ctx.currentTime);
-              };
-            }
-
-            initMasterBus(ctx);
-          }
-
-          // Resume if suspended (iOS WebKit requirement on user action)
-          if (ctx.state === 'suspended') {
-            log('AUDIO-RESUME', 'Context suspended, triggering resume()...');
-            var p = ctx.resume();
-            if (p && typeof p.then === 'function') {
-              p.then(function() {
-                log('AUDIO-RESUME', 'resume() promise resolved successfully. State: ' + ctx.state);
-              }).catch(function(err) {
-                log('AUDIO-RESUME-ERR', 'resume() rejected: ' + err.message);
+          function fetchAndDecode(url, expectedLen) {
+            return fetch(url)
+              .then(function(resp) {
+                if (!resp.ok) throw new Error('HTTP ' + resp.status + ' fetching ' + url);
+                return resp.arrayBuffer();
+              })
+              .then(function(arrBuf) {
+                return decCtx.decodeAudioData(arrBuf);
+              })
+              .then(function(audioBuf) {
+                var ch = audioBuf.getChannelData(0);
+                var out = new Float32Array(expectedLen);
+                out.set(ch.subarray(0, Math.min(ch.length, expectedLen)));
+                return out;
               });
-            }
           }
 
-          // Force hardware buffer unlock on first gesture
-          unlockIOSAudio(ctx);
+          mp4DecodePromise = Promise.all([
+            fetchAndDecode(AUDIO_FILES.bell, BELL_SAMPLES),
+            fetchAndDecode(AUDIO_FILES.hornAttack, HORN_ATTACK_SAMPLES),
+            fetchAndDecode(AUDIO_FILES.hornSustain, HORN_SUSTAIN_SAMPLES),
+            fetchAndDecode(AUDIO_FILES.hornRelease, HORN_RELEASE_SAMPLES)
+          ]).then(function(res) {
+            PCM_DATA.bell = res[0];
+            PCM_DATA.hornAttack = res[1];
+            PCM_DATA.hornSustain = res[2];
+            PCM_DATA.hornRelease = res[3];
+            // Combined contiguous [hornAttack, hornSustain] array so Attack -> Sustain handoff
+            // and native AudioBufferSourceNode loop (loopStart..loopEnd) have zero sample-rate rounding jitter
+            PCM_DATA.hornAttackSustain = new Float32Array(PCM_DATA.hornAttack.length + PCM_DATA.hornSustain.length);
+            PCM_DATA.hornAttackSustain.set(PCM_DATA.hornAttack, 0);
+            PCM_DATA.hornAttackSustain.set(PCM_DATA.hornSustain, PCM_DATA.hornAttack.length);
+            PCM_DATA.ready = true;
+            if (ctx) {
+              liveBuffers = createBuffersForContext(ctx);
+            }
+            log('AUDIO', 'Loaded and decoded .mp4 sub-samples via fetch + decodeAudioData', {
+              bellSamples: PCM_DATA.bell.length,
+              hornAttackSamples: PCM_DATA.hornAttack.length,
+              hornSustainSamples: PCM_DATA.hornSustain.length,
+              hornReleaseSamples: PCM_DATA.hornRelease.length
+            });
+            return PCM_DATA;
+          }).catch(function(err) {
+            log('AUDIO-ERR', 'Failed loading .mp4 sub-samples: ' + (err ? err.message : 'unknown'));
+            throw err;
+          });
+          return mp4DecodePromise;
+        }
 
-          return ctx;
+        // Kick off MP4 preloading immediately on script load
+        ensureMp4Decoded();
+
+        function createBuffersForContext(targetCtx) {
+          function makeBuf(f32) {
+            var buf = targetCtx.createBuffer(1, f32.length, SAMPLE_RATE);
+            buf.getChannelData(0).set(f32);
+            return buf;
+          }
+          return {
+            bell: makeBuf(PCM_DATA.bell),
+            hornAttack: makeBuf(PCM_DATA.hornAttack),
+            hornSustain: makeBuf(PCM_DATA.hornSustain),
+            hornRelease: makeBuf(PCM_DATA.hornRelease),
+            hornAttackSustain: makeBuf(PCM_DATA.hornAttackSustain),
+            attackDuration: HORN_ATTACK_SAMPLES / SAMPLE_RATE,
+            sustainDuration: HORN_SUSTAIN_SAMPLES / SAMPLE_RATE,
+            releaseDuration: HORN_RELEASE_SAMPLES / SAMPLE_RATE,
+            bellDuration: BELL_SAMPLES / SAMPLE_RATE
+          };
+        }
+
+        function buildMasterBusForContext(targetCtx) {
+          var busGain = targetCtx.createGain();
+          busGain.gain.setValueAtTime(0.92, targetCtx.currentTime);
+
+          // Gentle master limiter to prevent clipping when horn + multiple bell strikes layer
+          var comp = targetCtx.createDynamicsCompressor();
+          comp.threshold.setValueAtTime(-2.5, targetCtx.currentTime);
+          comp.knee.setValueAtTime(6.0, targetCtx.currentTime);
+          comp.ratio.setValueAtTime(8.0, targetCtx.currentTime);
+          comp.attack.setValueAtTime(0.002, targetCtx.currentTime);
+          comp.release.setValueAtTime(0.080, targetCtx.currentTime);
+
+          busGain.connect(comp);
+          comp.connect(targetCtx.destination);
+          return busGain;
         }
 
         function unlockIOSAudio(c) {
           if (!c) return;
           if (isAudioUnlocked && c.state === 'running') return;
-
-          log('AUDIO-UNLOCK', 'Attempting iOS WebKit audio graph unlock (state=' + c.state + ')');
           try {
-            // Play 1 sample of silence directly to destination within user gesture
-            var buffer = c.createBuffer(1, 1, 22050);
-            var source = c.createBufferSource();
-            source.buffer = buffer;
-            source.connect(c.destination);
-            source.start(0);
+            var silentBuf = c.createBuffer(1, 1, 22050);
+            var src = c.createBufferSource();
+            src.buffer = silentBuf;
+            src.connect(c.destination);
+            src.start(0);
             isAudioUnlocked = true;
-            log('AUDIO-UNLOCK', 'Direct silent buffer triggered on c.destination');
-          } catch (e) {
-            log('AUDIO-UNLOCK-WARN', 'Failed playing unlock silent buffer: ' + e.message);
-          }
+          } catch (e) {}
         }
 
-        // Generates an acoustic impulse response for mountain valley reverb
-        function createReverbImpulse(c, duration, decay) {
-          try {
-            var rate = c.sampleRate || 44100;
-            var length = Math.floor(rate * duration);
-            var impulse = c.createBuffer(2, length, rate);
-            var left = impulse.getChannelData(0);
-            var right = impulse.getChannelData(1);
-            var attackLen = Math.floor(rate * 0.012); // 12ms smooth attack window prevents transient click
-            for (var i = 0; i < length; i++) {
-              var t = i / rate;
-              var env = Math.exp(-t * decay);
-              var fadeIn = i < attackLen ? (i / attackLen) : 1.0;
-              left[i] = (Math.random() * 2 - 1) * env * fadeIn * 0.32;
-              right[i] = (Math.random() * 2 - 1) * env * fadeIn * 0.32;
+        function getAudioCtx() {
+          if (!ctx) {
+            var AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) {
+              log('AUDIO-ERR', 'Web Audio API not supported in this browser!');
+              return null;
             }
-            return impulse;
-          } catch (e) {
-            log('REVERB-ERR', 'createReverbImpulse failed: ' + e.message);
+            try {
+              ctx = new AudioCtx({ latencyHint: 'interactive' });
+            } catch (e) {
+              ctx = new AudioCtx();
+            }
+            masterBus = buildMasterBusForContext(ctx);
+            liveBuffers = createBuffersForContext(ctx);
+            log('AUDIO', 'Created AudioContext & isolated sample buffers', {
+              state: ctx.state,
+              sampleRate: ctx.sampleRate
+            });
+          }
+          if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
+            ctx.resume().then(function() {
+              log('AUDIO', 'AudioContext resumed (' + ctx.state + ')');
+            }).catch(function(err) {
+              log('AUDIO-ERR', 'Failed to resume AudioContext: ' + err.message);
+            });
+          }
+          unlockIOSAudio(ctx);
+          return ctx;
+        }
+
+        // =====================================================================
+        // HORN SUB-SAMPLE ENGINE (Attack -> Looping Sustain -> Release/Decay)
+        //   - On Press (startHorn): Plays isolated horn_attack.mp4 (0.2200s) and
+        //     seamlessly transitions at exact sample 9,702 into C^inf-periodic
+        //     de-pulsed horn_sustain.mp4 (1.1000s) for as long as the button is held.
+        //   - On Release (stopHorn): Handles any hold duration (from micro-taps
+        //     <95ms up to infinite sustain holds) via a 25ms equal-power
+        //     crossfade into isolated horn_release.mp4 (0.3300s).
+        // =====================================================================
+        var MIN_ATTACK_HOLD_SEC = 0.095;
+        var RELEASE_XFADE_SEC = 0.025;
+
+        function startHorn(targetCtx, targetDest, startTimeOverride, buffersOverride) {
+          var isOffline = !!(targetCtx && targetDest);
+          if (!isOffline && hornActive) return activeHornVoice;
+
+          var c = targetCtx || getAudioCtx();
+          if (!c) return null;
+          if (!isOffline && !PCM_DATA.ready) {
+            ensureMp4Decoded().then(function() {
+              startHorn();
+            });
             return null;
           }
-        }
+          var dest = targetDest || masterBus;
+          var bufs = buffersOverride || (c === ctx ? liveBuffers : createBuffersForContext(c));
+          var now = (startTimeOverride !== undefined) ? startTimeOverride : c.currentTime;
 
-        // Master spatial audio bus with brickwall limiter, dry, toned-down valley reverb, and filtered slapback echo
-        function initMasterBus(c) {
-          if (masterBus) return;
-          log('BUS', 'Initializing master audio bus...');
-          try {
-            // Master Dynamics Compressor / Limiter
-            var limiter = c.createDynamicsCompressor();
-            limiter.threshold.setValueAtTime(-2.0, c.currentTime);
-            limiter.knee.setValueAtTime(3.0, c.currentTime);
-            limiter.ratio.setValueAtTime(20.0, c.currentTime);
-            limiter.attack.setValueAtTime(0.001, c.currentTime);
-            limiter.release.setValueAtTime(0.05, c.currentTime);
-            limiter.connect(c.destination);
-
-            masterBus = c.createGain();
-            masterBus.gain.setValueAtTime(0.85, c.currentTime);
-
-            // 1. Dry path
-            var dryGain = c.createGain();
-            dryGain.gain.setValueAtTime(0.74, c.currentTime);
-            masterBus.connect(dryGain);
-            dryGain.connect(limiter);
-
-            // 2. Valley Reverb path
-            try {
-              var revBuf = createReverbImpulse(c, 1.8, 3.0);
-              if (revBuf) {
-                var convolver = c.createConvolver();
-                convolver.buffer = revBuf;
-                var revGain = c.createGain();
-                revGain.gain.setValueAtTime(0.12, c.currentTime);
-                masterBus.connect(convolver);
-                convolver.connect(revGain);
-                revGain.connect(limiter);
-              }
-            } catch (e) {
-              log('BUS-WARN', 'Convolver setup exception: ' + e.message);
-            }
-
-            // 3. Valley Slapback Echo path
-            try {
-              var echoDelay = c.createDelay();
-              echoDelay.delayTime.setValueAtTime(0.22, c.currentTime);
-              var echoFeedback = c.createGain();
-              echoFeedback.gain.setValueAtTime(0.18, c.currentTime);
-              var echoFilter = c.createBiquadFilter();
-              echoFilter.type = 'bandpass';
-              echoFilter.frequency.setValueAtTime(1100, c.currentTime);
-              echoFilter.Q.setValueAtTime(0.9, c.currentTime);
-              var echoGain = c.createGain();
-              echoGain.gain.setValueAtTime(0.10, c.currentTime);
-
-              masterBus.connect(echoDelay);
-              echoDelay.connect(echoFilter);
-              echoFilter.connect(echoFeedback);
-              echoFeedback.connect(echoDelay);
-              echoDelay.connect(echoGain);
-              echoGain.connect(limiter);
-            } catch (e) {
-              log('BUS-WARN', 'Echo delay setup exception: ' + e.message);
-            }
-
-            log('BUS', 'Master audio bus initialized successfully.');
-          } catch (err) {
-            log('BUS-FATAL', 'initMasterBus failed: ' + err.message);
-          }
-        }
-
-        function createNoise(duration) {
-          var c = getAudioCtx();
-          if (!c) return null;
-          var len = Math.floor(c.sampleRate * (duration || 1));
-          var buf = c.createBuffer(1, len, c.sampleRate);
-          var d = buf.getChannelData(0);
-          for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
-          return buf;
-        }
-
-        function makeDistortion(k) {
-          var n = 256, curve = new Float32Array(n);
-          for (var i = 0; i < n; i++) {
-            var x = (i * 2) / n - 1;
-            curve[i] = ((Math.PI + k) * x) / (Math.PI + k * Math.abs(x));
-          }
-          return curve;
-        }
-
-        // Mechanical pneumatic valve click transient
-        function triggerValveThump(time) {
-          var c = getAudioCtx();
-          if (!c) return;
-          try {
-            var osc = c.createOscillator();
-            var g = c.createGain();
-            osc.type = 'sine';
-            osc.frequency.setValueAtTime(144.57, time);
-            osc.frequency.exponentialRampToValueAtTime(38, time + 0.018);
-            g.gain.setValueAtTime(0.307, time);
-            g.gain.exponentialRampToValueAtTime(0.001, time + 0.020);
-            osc.connect(g);
-            if (masterBus) g.connect(masterBus);
-            osc.start(time);
-            osc.stop(time + 0.022);
-          } catch (e) {
-            log('HORN-WARN', 'triggerValveThump error: ' + e.message);
-          }
-        }
-
-        function triggerAirRelease(time) {
-          var c = getAudioCtx();
-          if (!c) return;
-          try {
-            var buf = createNoise(0.14);
-            if (!buf) return;
-            var src = c.createBufferSource();
-            src.buffer = buf;
-            var filter = c.createBiquadFilter();
-            filter.type = 'bandpass';
-            filter.frequency.setValueAtTime(2040, time);
-            filter.Q.setValueAtTime(1.2, time);
-            var gain = c.createGain();
-            gain.gain.setValueAtTime(0.0001, time);
-            gain.gain.linearRampToValueAtTime(0.052, time + 0.015);
-            gain.gain.exponentialRampToValueAtTime(0.001, time + 0.12);
-            src.connect(filter);
-            filter.connect(gain);
-            if (masterBus) gain.connect(masterBus);
-            src.start(time);
-            src.stop(time + 0.14);
-          } catch (e) {
-            log('HORN-WARN', 'triggerAirRelease error: ' + e.message);
-          }
-        }
-
-        function startHorn() {
-          log('HORN', 'startHorn() requested. Current hornActive: ' + hornActive);
-          if (hornActive) return;
-          var c = getAudioCtx();
-          if (!c) {
-            log('HORN-FATAL', 'startHorn aborted: AudioContext is null');
-            return;
+          if (!isOffline) {
+            hornActive = true;
+            glitchMetrics.totalHornStarts++;
+            glitchMetrics.activeVoiceCount++;
           }
 
-          hornActive = true;
-          log('HORN', 'startHorn active. Context state: ' + c.state + ', currentTime: ' + c.currentTime);
-          
-          try {
-            hornStart = c.currentTime;
-            var now = c.currentTime;
+          var voiceMaster = c.createGain();
+          voiceMaster.gain.setValueAtTime(0.95, now);
+          voiceMaster.connect(dest);
 
-            var master = c.createGain();
-            hornGain = master;
-            master.connect(masterBus);
+          var sustainGain = c.createGain();
+          // Tiny 1.5ms onset ramp from 0 to 1 prevents any sub-sample trigger click
+          sustainGain.gain.setValueAtTime(0.0, now);
+          sustainGain.gain.linearRampToValueAtTime(1.0, now + 0.0015);
+          sustainGain.connect(voiceMaster);
 
-            var rampTime = 0.093;
-            master.gain.setValueAtTime(0.18, now);
-            master.gain.linearRampToValueAtTime(0.696, now + rampTime);
-            master.gain.exponentialRampToValueAtTime(0.158, now + rampTime + 0.30);
+          // Play hornAttackSustain buffer:
+          // [0 .. attackDuration] = isolated horn_attack.mp4
+          // [attackDuration .. attackDuration + sustainDuration] = isolated horn_sustain.mp4 (looped)
+          var src = c.createBufferSource();
+          src.buffer = bufs.hornAttackSustain;
+          src.loop = true;
+          src.loopStart = bufs.attackDuration;
+          src.loopEnd = bufs.attackDuration + bufs.sustainDuration;
+          src.connect(sustainGain);
+          src.start(now);
 
-            triggerValveThump(now);
+          var voice = {
+            ctx: c,
+            buffers: bufs,
+            startTime: now,
+            voiceMaster: voiceMaster,
+            sustainGain: sustainGain,
+            src: src,
+            released: false
+          };
 
-            // Calibrated flute/whistle harmonic pipes:
-            var chimes = [
-              // High chime (1286.24 Hz)
-              { f: 1286.24, type: 'sine',     v: 0.138, detune: -1.5, release: 0.140, pDrop: 0.040 },
-              { f: 1286.24, type: 'triangle', v: 0.086, detune: 0,    release: 0.140, pDrop: 0.040 },
-              { f: 2572.48, type: 'sine',     v: 0.202, detune: -1.5, release: 0.135, pDrop: 0.035 },
-              // Mid chime (1038.48 Hz)
-              { f: 1038.48, type: 'sine',     v: 0.050, detune: 1.0,  release: 0.126, pDrop: 0.026 },
-              { f: 1038.48, type: 'triangle', v: 0.215, detune: 0,    release: 0.126, pDrop: 0.026 },
-              { f: 2076.96, type: 'sine',     v: 0.106, detune: 1.0,  release: 0.120, pDrop: 0.024 },
-              { f: 3115.44, type: 'sine',     v: 0.117, detune: 1.0,  release: 0.115, pDrop: 0.022 },
-              // Root fundamental pipe (846.25 Hz)
-              { f: 846.25,  type: 'sine',     v: 0.236, detune: 0,    release: 0.450, pDrop: 0.049 },
-              { f: 846.25,  type: 'triangle', v: 0.174, detune: 0,    release: 0.450, pDrop: 0.049 },
-              { f: 1692.50, type: 'sine',     v: 0.142, detune: 0,    release: 0.380, pDrop: 0.045 },
-              { f: 2538.75, type: 'sine',     v: 0.091, detune: 0,    release: 0.320, pDrop: 0.040 },
-              // Whistle mouth air lock stabilizing resonance (1109.24 Hz)
-              { f: 1109.24, type: 'sine',     v: 0.120, detune: 2.0,  release: 0.318, pDrop: 0.016 },
-              { f: 1109.24, type: 'triangle', v: 0.065, detune: 0,    release: 0.318, pDrop: 0.016 },
-              // Hollow lower body cavity resonance (644.40 Hz)
-              { f: 644.40,  type: 'sine',     v: 0.180, detune: -2.0, release: 0.450, pDrop: 0.034 },
-              { f: 644.40,  type: 'triangle', v: 0.095, detune: 0,    release: 0.450, pDrop: 0.034 }
-            ];
-
-            var pipeInstances = [];
-
-            // Whistle acoustic body filter (2040 Hz cutoff)
-            var acousticFilter = c.createBiquadFilter();
-            acousticFilter.type = 'lowpass';
-            acousticFilter.frequency.setValueAtTime(2040, now);
-            acousticFilter.Q.setValueAtTime(0.707, now);
-            acousticFilter.connect(master);
-
-            chimes.forEach(function(chime) {
-              var osc = c.createOscillator();
-              var gain = c.createGain();
-              osc.type = chime.type;
-              osc.frequency.setValueAtTime(chime.f, now);
-              osc.detune.setValueAtTime(chime.detune, now);
-              gain.gain.setValueAtTime(chime.v, now);
-
-              osc.connect(gain);
-              gain.connect(acousticFilter);
-              osc.start(now);
-
-              pipeInstances.push({
-                osc: osc,
-                gain: gain,
-                f: chime.f,
-                v: chime.v,
-                release: chime.release,
-                pDrop: chime.pDrop
-              });
+          if (!isOffline) {
+            activeHornVoice = voice;
+            log('HORN', 'Started Horn Attack -> Sustain Loop', {
+              startTime: Number(now.toFixed(3)),
+              loopStart: Number(src.loopStart.toFixed(4)),
+              loopEnd: Number(src.loopEnd.toFixed(4))
             });
-
-            // Gentle aerated breath hiss
-            var airHissBuf = createNoise(4.0);
-            var airHiss = c.createBufferSource();
-            airHiss.buffer = airHissBuf;
-            airHiss.loop = true;
-
-            var noiseFilter = c.createBiquadFilter();
-            noiseFilter.type = 'bandpass';
-            noiseFilter.frequency.setValueAtTime(1450, now);
-            noiseFilter.Q.setValueAtTime(1.4, now);
-
-            var noiseGain = c.createGain();
-            noiseGain.gain.setValueAtTime(0.0001, now);
-            noiseGain.gain.linearRampToValueAtTime(0.018, now + 0.05);
-
-            airHiss.connect(noiseFilter);
-            noiseFilter.connect(noiseGain);
-            noiseGain.connect(master);
-            airHiss.start(now);
-
-            // Aerodynamic air modulation LFO (7.8 Hz)
-            var flutterLfo = c.createOscillator();
-            flutterLfo.frequency.setValueAtTime(7.8, now);
-            var flutterGain = c.createGain();
-            flutterGain.gain.setValueAtTime(0.035, now);
-            flutterLfo.connect(flutterGain);
-            flutterGain.connect(master.gain);
-            flutterLfo.start(now);
-
-            hornNodes = {
-              pipes: pipeInstances,
-              noise: airHiss,
-              nG: noiseGain,
-              airFlutter: flutterLfo,
-              fG: flutterGain
-            };
-            log('HORN', 'Pipes and oscillators started successfully (' + pipeInstances.length + ' pipes)');
-          } catch (e) {
-            log('HORN-ERR', 'Error starting horn: ' + e.message);
           }
+          return voice;
         }
 
-        function stopHorn() {
-          log('HORN', 'stopHorn() called. hornActive: ' + hornActive);
-          if (!hornActive) return;
-          hornActive = false;
-          var c = getAudioCtx();
-          if (!c) return;
+        function stopHorn(voiceOverride, stopTimeOverride) {
+          var voice = voiceOverride || activeHornVoice;
+          if (!voice || voice.released) return;
+          if (!voiceOverride && !hornActive) return;
+
+          voice.released = true;
+          if (!voiceOverride) {
+            hornActive = false;
+            activeHornVoice = null;
+            glitchMetrics.totalHornStops++;
+          }
 
           try {
-            var now = c.currentTime;
-            var surgePeakDelay = 0.192;
-            var surgeGain = 0.512;
-            var maxRelease = 0.450;
+            var c = voice.ctx;
+            var bufs = voice.buffers;
+            var now = (stopTimeOverride !== undefined) ? stopTimeOverride : c.currentTime;
+            var rawElapsed = Math.max(0.0, now - voice.startTime);
 
-            if (hornNodes && hornNodes.fG) {
-              try {
-                hornNodes.fG.gain.cancelScheduledValues(now);
-                hornNodes.fG.gain.setValueAtTime(hornNodes.fG.gain.value, now);
-                hornNodes.fG.gain.linearRampToValueAtTime(0, now + 0.04);
-              } catch (e) {}
+            // Ensure micro-taps (< 95ms) play at least 95ms of the attack transient before crossfading to release
+            var tRel = Math.max(now, voice.startTime + MIN_ATTACK_HOLD_SEC);
+            var effectiveHold = tRel - voice.startTime;
+
+            // Scale release slightly on ultra-brief taps (< 160ms) so envelope matches attack level
+            var relScale = (effectiveHold < 0.160) ? (0.78 + 0.22 * (effectiveHold / 0.160)) : 1.0;
+
+            // 1) Equal-power cosine fade-out on the active Attack/Sustain stream over RELEASE_XFADE_SEC (25ms)
+            voice.sustainGain.gain.cancelScheduledValues(tRel);
+            voice.sustainGain.gain.setValueAtTime(1.0, tRel);
+            voice.sustainGain.gain.setValueCurveAtTime(FADE_OUT_CURVE, tRel, RELEASE_XFADE_SEC);
+            voice.sustainGain.gain.setValueAtTime(0.0, tRel + RELEASE_XFADE_SEC + 0.001);
+            voice.src.stop(tRel + RELEASE_XFADE_SEC + 0.005);
+
+            // 2) Equal-power sine fade-in on isolated horn_release.mp4 starting at tRel
+            var relGain = c.createGain();
+            var scaledFadeIn = new Float32Array(XFADE_CURVE_LEN);
+            for (var i = 0; i < XFADE_CURVE_LEN; i++) {
+              scaledFadeIn[i] = FADE_IN_CURVE[i] * relScale;
             }
+            relGain.gain.setValueAtTime(0.0, tRel);
+            relGain.gain.setValueCurveAtTime(scaledFadeIn, tRel, RELEASE_XFADE_SEC);
+            relGain.connect(voice.voiceMaster);
 
-            // Pipe staggered dropouts and pressure pitch drop
-            if (hornNodes && hornNodes.pipes) {
-              hornNodes.pipes.forEach(function(p) {
+            var relSrc = c.createBufferSource();
+            relSrc.buffer = bufs.hornRelease;
+            relSrc.connect(relGain);
+            relSrc.start(tRel);
+            var tEnd = tRel + bufs.releaseDuration;
+            relSrc.stop(tEnd + 0.01);
+
+            if (!voiceOverride) {
+              setTimeout(function() {
                 try {
-                  var dropRatio = 1.0 - (p.pDrop || 0.04);
-                  p.osc.frequency.cancelScheduledValues(now);
-                  p.osc.frequency.setValueAtTime(p.osc.frequency.value, now);
-                  p.osc.frequency.exponentialRampToValueAtTime(Math.max(30, p.f * dropRatio), now + p.release);
-                  p.gain.gain.cancelScheduledValues(now);
-                  p.gain.gain.setValueAtTime(p.gain.gain.value, now);
-                  p.gain.gain.exponentialRampToValueAtTime(0.0001, now + p.release);
-                  p.osc.stop(now + p.release + 0.04);
+                  voice.voiceMaster.disconnect();
+                  glitchMetrics.activeVoiceCount = Math.max(0, glitchMetrics.activeVoiceCount - 1);
                 } catch (e) {}
+              }, Math.ceil((tEnd - c.currentTime + 0.05) * 1000));
+              log('HORN', 'Scheduled Horn Release sub-sample transition', {
+                rawHoldMs: Math.round(rawElapsed * 1000),
+                effectiveHoldMs: Math.round(effectiveHold * 1000),
+                xfadeMs: Math.round(RELEASE_XFADE_SEC * 1000)
               });
             }
-
-            // Master volume surge and falloff
-            if (hornGain) {
-              hornGain.gain.cancelScheduledValues(now);
-              var curGain = hornGain.gain.value;
-              hornGain.gain.setValueAtTime(curGain, now);
-              hornGain.gain.linearRampToValueAtTime(surgeGain, now + surgePeakDelay);
-              hornGain.gain.exponentialRampToValueAtTime(0.0001, now + maxRelease);
-            }
-
-            if (hornNodes && hornNodes.nG) {
-              try {
-                hornNodes.nG.gain.cancelScheduledValues(now);
-                hornNodes.nG.gain.setValueAtTime(hornNodes.nG.gain.value, now);
-                hornNodes.nG.gain.exponentialRampToValueAtTime(0.0001, now + 0.14);
-              } catch (e) {}
-            }
-
-            triggerAirRelease(now);
-
-            var nodes = hornNodes;
-            setTimeout(function() {
-              if (nodes) {
-                if (nodes.pipes) {
-                  nodes.pipes.forEach(function(p) {
-                    try { p.osc.disconnect(); p.gain.disconnect(); } catch (e) {}
-                  });
-                }
-                if (nodes.noise) { try { nodes.noise.stop(); nodes.noise.disconnect(); } catch (e) {} }
-                if (nodes.airFlutter) { try { nodes.airFlutter.stop(); nodes.airFlutter.disconnect(); } catch (e) {} }
-              }
-            }, (maxRelease + 0.1) * 1000);
-
-            hornNodes = null;
-            hornGain = null;
-            log('HORN', 'stopHorn release envelopes scheduled.');
           } catch (e) {
             log('HORN-ERR', 'stopHorn error: ' + e.message);
           }
         }
 
-        function strikeBell() {
-          log('BELL', 'strikeBell() called');
-          var c = getAudioCtx();
-          if (!c) {
-            log('BELL-FATAL', 'strikeBell aborted: AudioContext is null');
+        // =====================================================================
+        // ISOLATED BELL SAMPLE PLAYBACK (bell_clean.mp4, 1.2500s)
+        // Straightforward sample playback on cue with polyphonic layering.
+        // =====================================================================
+        function strikeBell(targetCtx, targetDest, startTimeOverride, buffersOverride) {
+          var isOffline = !!(targetCtx && targetDest);
+          var c = targetCtx || getAudioCtx();
+          if (!c) return;
+          if (!isOffline && !PCM_DATA.ready) {
+            ensureMp4Decoded().then(function() {
+              strikeBell();
+            });
             return;
           }
+          var dest = targetDest || masterBus;
+          var bufs = buffersOverride || (c === ctx ? liveBuffers : createBuffersForContext(c));
+          var now = (startTimeOverride !== undefined) ? startTimeOverride : c.currentTime;
 
-          try {
-            var now = c.currentTime;
-            bellStrikeCount++;
+          bellStrikeCount++;
+          if (!isOffline) glitchMetrics.totalBellStrikes++;
 
-            var baseF = 1700.0;
-            var wLfo = c.createOscillator();
-            wLfo.type = 'sine';
-            wLfo.frequency.setValueAtTime(20.4, now);
-            var wGain = c.createGain();
-            wGain.gain.setValueAtTime(14.0, now);
-            wGain.gain.exponentialRampToValueAtTime(2.5, now + 1.8);
-            wLfo.connect(wGain);
-            wLfo.start(now);
-            wLfo.stop(now + 2.2);
+          // Prune finished bell voices
+          activeBellVoices = activeBellVoices.filter(function(v) {
+            return v.ctx === c && (now - v.startTime) >= 0 && (now - v.startTime) < bufs.bellDuration;
+          });
+          if (!isOffline && activeBellVoices.length >= 10) {
+            var oldest = activeBellVoices.shift();
+            try {
+              oldest.voiceGain.gain.cancelScheduledValues(now);
+              oldest.voiceGain.gain.setValueAtTime(oldest.scale, now);
+              oldest.voiceGain.gain.linearRampToValueAtTime(0.0001, now + 0.025);
+              oldest.src.stop(now + 0.030);
+            } catch (e) {}
+          }
 
-            var partials = [
-              { f: baseF, g: 0.34, d: 2.0, dt: 0 },
-              { f: baseF * 1.0025, g: 0.24, d: 1.7, dt: 2 },
-              { f: baseF * 1.189, g: 0.18, d: 1.3, dt: -3 },
-              { f: baseF * 1.5, g: 0.14, d: 1.0, dt: 4 },
-              { f: baseF * 2.0, g: 0.10, d: 0.7, dt: 2 },
-              { f: baseF * 2.756, g: 0.06, d: 0.5, dt: -3 },
-              { f: baseF * 0.5, g: 0.15, d: 2.1, dt: 0 }
-            ];
+          var polyCount = activeBellVoices.length;
+          var polyScale = 0.88 / Math.sqrt(1.0 + 0.28 * polyCount);
+          // Subtle +/- 1.2 cents detuning across rapid repeated strikes prevents comb filtering
+          var detuneCents = ((bellStrikeCount % 5) - 2) * 0.6;
 
-            var bellMaster = c.createGain();
-            bellMaster.gain.setValueAtTime(0.70, now);
-            bellMaster.connect(masterBus);
+          var voiceGain = c.createGain();
+          voiceGain.gain.setValueAtTime(polyScale, now);
+          voiceGain.connect(dest);
 
-            partials.forEach(function(p) {
-              var osc = c.createOscillator();
-              var g = c.createGain();
-              osc.type = 'sine';
-              osc.frequency.setValueAtTime(p.f, now);
-              osc.detune.setValueAtTime(p.dt, now);
-              wGain.connect(osc.detune);
-              g.gain.setValueAtTime(p.g, now);
-              g.gain.exponentialRampToValueAtTime(0.0001, now + p.d);
-              osc.connect(g);
-              g.connect(bellMaster);
-              osc.start(now);
-              osc.stop(now + p.d);
-            });
+          var src = c.createBufferSource();
+          src.buffer = bufs.bell;
+          src.detune.setValueAtTime(detuneCents, now);
+          src.connect(voiceGain);
+          src.start(now);
+          src.stop(now + bufs.bellDuration + 0.01);
 
-            // Strike transient click
-            var src = c.createBufferSource();
-            src.buffer = createNoise(0.025);
-            var filter = c.createBiquadFilter();
-            filter.type = 'highpass';
-            filter.frequency.setValueAtTime(4500, now);
-            var sG = c.createGain();
-            sG.gain.setValueAtTime(0.0001, now);
-            sG.gain.linearRampToValueAtTime(0.12, now + 0.002);
-            sG.gain.exponentialRampToValueAtTime(0.0001, now + 0.025);
-            src.connect(filter);
-            filter.connect(sG);
-            sG.connect(bellMaster);
-            src.start(now);
-            src.stop(now + 0.03);
+          var vObj = { ctx: c, startTime: now, voiceGain: voiceGain, src: src, scale: polyScale };
+          activeBellVoices.push(vObj);
 
-            log('BELL', 'strikeBell scheduled with ' + partials.length + ' partials.');
-          } catch (e) {
-            log('BELL-ERR', 'strikeBell error: ' + e.message);
+          if (!isOffline) {
+            glitchMetrics.activeVoiceCount++;
+            setTimeout(function() {
+              try {
+                voiceGain.disconnect();
+                glitchMetrics.activeVoiceCount = Math.max(0, glitchMetrics.activeVoiceCount - 1);
+                activeBellVoices = activeBellVoices.filter(function(v) { return v !== vObj; });
+              } catch (e) {}
+            }, Math.ceil((bufs.bellDuration + 0.04) * 1000));
+            log('BELL', 'Bell sample strike #' + bellStrikeCount + ' (activeLayeredVoices=' + activeBellVoices.length + ')');
           }
         }
 
+        // --- OfflineAudioContext Glitch & Multi-Duration Verification Hook ---
+        async function runOfflineVerification() {
+          await ensureMp4Decoded();
+          var OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+          var sr = SAMPLE_RATE;
+          var dur = 6.2;
+          var offCtx = new OfflineCtx(1, Math.floor(sr * dur), sr);
+          var offBus = buildMasterBusForContext(offCtx);
+          var offBufs = createBuffersForContext(offCtx);
+
+          // Test 1: Ultra-short micro-tap (30ms button press -> 95ms min attack + release)
+          var hv1 = startHorn(offCtx, offBus, 0.05, offBufs);
+          stopHorn(hv1, 0.08);
+
+          // Test 2: Mid-attack interrupt (160ms button press -> crossfades during attack into release)
+          var hv2 = startHorn(offCtx, offBus, 0.60, offBufs);
+          stopHorn(hv2, 0.76);
+
+          // Test 3: Multi-loop sustain hold (1.30s to 4.10s = 2.80s hold, looping horn_sustain > 2 times!)
+          var hv3 = startHorn(offCtx, offBus, 1.30, offBufs);
+          stopHorn(hv3, 4.10);
+
+          // Test 4: Rapid layered Bell strikes (4.60s, 4.72s, 4.84s)
+          strikeBell(offCtx, offBus, 4.60, offBufs);
+          strikeBell(offCtx, offBus, 4.72, offBufs);
+          strikeBell(offCtx, offBus, 4.84, offBufs);
+
+          var rendered = await offCtx.startRendering();
+          var pcm = rendered.getChannelData(0);
+          var maxPeak = 0;
+          var maxHornStep = 0;
+          var maxBellStep = 0;
+          var nanCount = 0;
+          var glitchSpikes = 0;
+          var bellStartSample = Math.floor(4.55 * sr);
+          for (var i = 0; i < pcm.length; i++) {
+            var v = pcm[i];
+            if (!isFinite(v)) { nanCount++; continue; }
+            var av = Math.abs(v);
+            if (av > maxPeak) maxPeak = av;
+            if (i > 0) {
+              var step = Math.abs(v - pcm[i - 1]);
+              if (i < bellStartSample) {
+                if (step > maxHornStep) maxHornStep = step;
+                if (step > 0.32) glitchSpikes++;
+              } else {
+                if (step > maxBellStep) maxBellStep = step;
+                if (step > 0.48) glitchSpikes++;
+              }
+            }
+          }
+          return {
+            model: 'isolated_subsamples_attack_sustain_release_mp4',
+            sampleRate: sr,
+            durationSec: dur,
+            subSamples: {
+              bellSec: Number(offBufs.bellDuration.toFixed(4)),
+              hornAttackSec: Number(offBufs.attackDuration.toFixed(4)),
+              hornSustainSec: Number(offBufs.sustainDuration.toFixed(4)),
+              hornReleaseSec: Number(offBufs.releaseDuration.toFixed(4))
+            },
+            maxPeak: Number(maxPeak.toFixed(4)),
+            maxHornSampleStep: Number(maxHornStep.toFixed(4)),
+            maxBellSampleStep: Number(maxBellStep.toFixed(4)),
+            nanCount: nanCount,
+            glitchSpikes: glitchSpikes,
+            passed: (nanCount === 0 && maxPeak > 0.25 && maxPeak <= 1.05 && glitchSpikes === 0)
+          };
+        }
+
+        window.__trainAudioTest = {
+          modelType: 'isolated_subsamples_mp4',
+          audioFiles: AUDIO_FILES,
+          pcmData: PCM_DATA,
+          startHorn: function() { return startHorn(); },
+          stopHorn: function() { return stopHorn(); },
+          strikeBell: function() { return strikeBell(); },
+          getDiagnostics: function() { return { glitchMetrics: glitchMetrics, logCount: logHistory.length, logs: logHistory.slice(-25) }; },
+          runOfflineVerification: runOfflineVerification
+        };
+
         // --- Clipboard Diagnostics Copy Routine (Ladybug handler) ---
         function copyDiagnosticsToClipboard() {
-          var header = '=== Big Walk Train Controls Diagnostic Report ===\n' +
+          var header = '=== Big Walk Train Controls Diagnostic Report (Isolated Sub-Sample Engine) ===\n' +
             'Timestamp: ' + new Date().toISOString() + '\n' +
             'UserAgent: ' + navigator.userAgent + '\n' +
-            'AudioContext: ' + (ctx ? ('State=' + ctx.state + ', currentTime=' + ctx.currentTime + ', sampleRate=' + ctx.sampleRate) : 'Not instantiated') + '\n' +
+            'AudioContext: ' + (ctx ? ('State=' + ctx.state + ', currentTime=' + ctx.currentTime.toFixed(3) + ', sampleRate=' + ctx.sampleRate) : 'Not instantiated') + '\n' +
             'isAudioUnlocked: ' + isAudioUnlocked + '\n' +
             'hornActive: ' + hornActive + '\n' +
             'bellStrikeCount: ' + bellStrikeCount + '\n' +
+            'GlitchMetrics: ' + JSON.stringify(glitchMetrics) + '\n' +
             'Log Entries (' + logHistory.length + '):\n' +
             '----------------------------------------\n';
 
           var fullLogText = header + logHistory.join('\n') + '\n========================================';
 
-          // Visual toast feedback
           function showToast(msg, isSuccess) {
             var banner = document.getElementById('log-toast-banner');
             var bugToast = document.getElementById('ladybug-toast');
@@ -815,14 +791,10 @@
             }
           }
 
-          log('DIAG', 'Copy logs requested by user.');
-
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(fullLogText).then(function() {
-              log('DIAG', 'Logs successfully copied via navigator.clipboard');
               showToast('Diagnostic logs copied to clipboard!', true);
-            }).catch(function(err) {
-              log('DIAG-WARN', 'navigator.clipboard.writeText failed: ' + err.message + ', attempting execCommand fallback');
+            }).catch(function() {
               fallbackCopy(fullLogText, showToast);
             });
           } else {
@@ -843,19 +815,16 @@
             var success = document.execCommand('copy');
             document.body.removeChild(textArea);
             if (success) {
-              log('DIAG', 'Logs successfully copied via document.execCommand fallback');
               callback('Diagnostic logs copied to clipboard!', true);
             } else {
               throw new Error('execCommand returned false');
             }
           } catch (e) {
-            log('DIAG-ERR', 'Clipboard fallback copy failed: ' + e.message);
             callback('Could not auto-copy. See console logs.', false);
           }
         }
 
         function bindEvents() {
-          log('EVENTS', 'Binding user control events...');
           var hBtn = document.getElementById('standalone-horn-btn');
           var bBtn = document.getElementById('standalone-bell-btn');
           var hDome = document.getElementById('standalone-horn-dome');
@@ -865,53 +834,38 @@
 
           if (ladybugBtn) {
             var onLadybugTap = function(e) {
-              if (e) {
-                e.preventDefault();
-                e.stopPropagation();
-              }
+              if (e) { e.preventDefault(); e.stopPropagation(); }
               ladybugBtn.style.transform = 'scale(0.85) rotate(-10deg)';
               setTimeout(function() {
                 ladybugBtn.style.transform = 'scale(1) rotate(0deg)';
               }, 200);
               copyDiagnosticsToClipboard();
             };
-
             ladybugBtn.addEventListener('touchstart', onLadybugTap, { passive: false });
             ladybugBtn.addEventListener('click', onLadybugTap);
-            log('EVENTS', 'Ladybug button event bound');
           }
 
-          if (!hBtn || !bBtn) {
-            log('EVENTS-WARN', 'Buttons not found: hBtn=' + !!hBtn + ', bBtn=' + !!bBtn);
-            return;
-          }
+          if (!hBtn || !bBtn) return;
 
           window.addEventListener('contextmenu', function(e) {
             e.preventDefault();
           }, { passive: false });
 
-          // Audio pre-unlocker on any touch anywhere on document
           document.addEventListener('touchstart', function() {
             getAudioCtx();
           }, { once: false, passive: true });
 
           function onHDown(e) {
             if (e) e.preventDefault();
-            log('TOUCH', 'onHDown event fired (type=' + (e ? e.type : 'none') + ')');
             startHorn();
             if (hBtn) hBtn.style.transform = 'translateY(6px) scale(0.94)';
             if (hDome) hDome.style.background = 'linear-gradient(to bottom, #8f2723, #ab312c, #6e1e1a)';
-            if (navigator.vibrate) {
-              try { navigator.vibrate(15); } catch (err) {}
-            }
+            if (navigator.vibrate) { try { navigator.vibrate(15); } catch (err) {} }
           }
 
           function onHUp(e) {
             if (e) e.preventDefault();
-            log('TOUCH', 'onHUp event fired (type=' + (e ? e.type : 'none') + ')');
-            if (navigator.vibrate) {
-              try { navigator.vibrate(0); } catch (err) {}
-            }
+            if (navigator.vibrate) { try { navigator.vibrate(0); } catch (err) {} }
             stopHorn();
             if (hBtn) hBtn.style.transform = 'none';
             if (hDome) hDome.style.background = 'linear-gradient(to bottom, #e34b44, #c93630, #99201a)';
@@ -919,30 +873,23 @@
 
           function onBDown(e) {
             if (e) e.preventDefault();
-            log('TOUCH', 'onBDown event fired (type=' + (e ? e.type : 'none') + ')');
             if (bellActive) return;
             bellActive = true;
             strikeBell();
             if (bBtn) bBtn.style.transform = 'translateY(6px) scale(0.94)';
             if (bDome) bDome.style.background = 'linear-gradient(to bottom, #a38029, #bf9832, #785b17)';
-            if (navigator.vibrate) {
-              try { navigator.vibrate(15); } catch (err) {}
-            }
+            if (navigator.vibrate) { try { navigator.vibrate(15); } catch (err) {} }
           }
 
           function onBUp(e) {
             if (e) e.preventDefault();
-            log('TOUCH', 'onBUp event fired (type=' + (e ? e.type : 'none') + ')');
-            if (navigator.vibrate) {
-              try { navigator.vibrate(0); } catch (err) {}
-            }
+            if (navigator.vibrate) { try { navigator.vibrate(0); } catch (err) {} }
             if (!bellActive) return;
             bellActive = false;
             if (bBtn) bBtn.style.transform = 'none';
             if (bDome) bDome.style.background = 'linear-gradient(to bottom, #ffd766, #dfad32, #a87d1d)';
           }
 
-          // Touch listeners for mobile devices
           hBtn.addEventListener('touchstart', onHDown, { passive: false });
           hBtn.addEventListener('touchend', onHUp, { passive: false });
           hBtn.addEventListener('touchcancel', onHUp, { passive: false });
@@ -951,40 +898,15 @@
           bBtn.addEventListener('touchend', onBUp, { passive: false });
           bBtn.addEventListener('touchcancel', onBUp, { passive: false });
 
-          // Mouse / pointer support (avoid firing twice on touch devices)
-          hBtn.addEventListener('pointerdown', function(e) {
-            if (e.pointerType === 'touch') return;
-            onHDown(e);
-          });
-          hBtn.addEventListener('pointerup', function(e) {
-            if (e.pointerType === 'touch') return;
-            onHUp(e);
-          });
-          hBtn.addEventListener('pointerleave', function(e) {
-            if (e.pointerType === 'touch') return;
-            onHUp(e);
-          });
-          hBtn.addEventListener('pointercancel', function(e) {
-            if (e.pointerType === 'touch') return;
-            onHUp(e);
-          });
+          hBtn.addEventListener('pointerdown', function(e) { if (e.pointerType !== 'touch') onHDown(e); });
+          hBtn.addEventListener('pointerup', function(e) { if (e.pointerType !== 'touch') onHUp(e); });
+          hBtn.addEventListener('pointerleave', function(e) { if (e.pointerType !== 'touch') onHUp(e); });
+          hBtn.addEventListener('pointercancel', function(e) { if (e.pointerType !== 'touch') onHUp(e); });
 
-          bBtn.addEventListener('pointerdown', function(e) {
-            if (e.pointerType === 'touch') return;
-            onBDown(e);
-          });
-          bBtn.addEventListener('pointerup', function(e) {
-            if (e.pointerType === 'touch') return;
-            onBUp(e);
-          });
-          bBtn.addEventListener('pointerleave', function(e) {
-            if (e.pointerType === 'touch') return;
-            onBUp(e);
-          });
-          bBtn.addEventListener('pointercancel', function(e) {
-            if (e.pointerType === 'touch') return;
-            onBUp(e);
-          });
+          bBtn.addEventListener('pointerdown', function(e) { if (e.pointerType !== 'touch') onBDown(e); });
+          bBtn.addEventListener('pointerup', function(e) { if (e.pointerType !== 'touch') onBUp(e); });
+          bBtn.addEventListener('pointerleave', function(e) { if (e.pointerType !== 'touch') onBUp(e); });
+          bBtn.addEventListener('pointercancel', function(e) { if (e.pointerType !== 'touch') onBUp(e); });
 
           window.addEventListener('keydown', function(e) {
             if (e.repeat) return;
