@@ -557,28 +557,45 @@
             var now = (stopTimeOverride !== undefined) ? stopTimeOverride : c.currentTime;
             var rawElapsed = Math.max(0.0, now - voice.startTime);
 
-            // Ensure micro-taps (< 95ms) play at least 95ms of the attack transient before crossfading to release
-            var tRel = Math.max(now, voice.startTime + MIN_ATTACK_HOLD_SEC);
+            // Ensure micro-taps (< 95ms) play at least 95ms of the attack transient before crossfading to release.
+            // On live touch, ensure tRel has a safe 3ms lead over audio rendering quantum to prevent Chrome auto-clamping desync.
+            var minRelTime = (stopTimeOverride !== undefined) ? now : (c.currentTime + 0.003);
+            var tRel = Math.max(minRelTime, voice.startTime + MIN_ATTACK_HOLD_SEC);
             var effectiveHold = tRel - voice.startTime;
 
             // Scale release slightly on ultra-brief taps (< 160ms) so envelope matches attack level
             var relScale = (effectiveHold < 0.160) ? (0.78 + 0.22 * (effectiveHold / 0.160)) : 1.0;
 
             // 1) Equal-power cosine fade-out on the active Attack/Sustain stream over RELEASE_XFADE_SEC (25ms)
-            voice.sustainGain.gain.cancelScheduledValues(tRel);
-            voice.sustainGain.gain.setValueAtTime(1.0, tRel);
-            voice.sustainGain.gain.setValueCurveAtTime(FADE_OUT_CURVE, tRel, RELEASE_XFADE_SEC);
-            voice.sustainGain.gain.setValueAtTime(0.0, tRel + RELEASE_XFADE_SEC + 0.001);
-            voice.src.stop(tRel + RELEASE_XFADE_SEC + 0.005);
+            try {
+              voice.sustainGain.gain.cancelScheduledValues(tRel);
+              voice.sustainGain.gain.setValueCurveAtTime(FADE_OUT_CURVE, tRel, RELEASE_XFADE_SEC);
+              voice.src.stop(tRel + RELEASE_XFADE_SEC + 0.020);
+            } catch (eFade) {
+              log('HORN-WARN', 'setValueCurveAtTime fade-out fallback: ' + eFade.message);
+              try {
+                voice.sustainGain.gain.cancelScheduledValues(tRel);
+                voice.sustainGain.gain.linearRampToValueAtTime(0.0001, tRel + RELEASE_XFADE_SEC);
+                voice.src.stop(tRel + RELEASE_XFADE_SEC + 0.020);
+              } catch (eFade2) {}
+            }
 
             // 2) Equal-power sine fade-in on isolated horn_release.mp4 starting at tRel
             var relGain = c.createGain();
+            relGain.gain.value = 0.0;
             var scaledFadeIn = new Float32Array(XFADE_CURVE_LEN);
             for (var i = 0; i < XFADE_CURVE_LEN; i++) {
               scaledFadeIn[i] = FADE_IN_CURVE[i] * relScale;
             }
-            relGain.gain.setValueAtTime(0.0, tRel);
-            relGain.gain.setValueCurveAtTime(scaledFadeIn, tRel, RELEASE_XFADE_SEC);
+            try {
+              relGain.gain.setValueCurveAtTime(scaledFadeIn, tRel, RELEASE_XFADE_SEC);
+            } catch (eCurveIn) {
+              log('HORN-WARN', 'setValueCurveAtTime fade-in fallback: ' + eCurveIn.message);
+              try {
+                relGain.gain.setValueAtTime(0.0001, tRel);
+                relGain.gain.linearRampToValueAtTime(relScale, tRel + RELEASE_XFADE_SEC);
+              } catch (eCurveIn2) {}
+            }
             relGain.connect(voice.voiceMaster);
 
             var relSrc = c.createBufferSource();
@@ -586,7 +603,7 @@
             relSrc.connect(relGain);
             relSrc.start(tRel);
             var tEnd = tRel + bufs.releaseDuration;
-            relSrc.stop(tEnd + 0.01);
+            relSrc.stop(tEnd + 0.020);
 
             if (!voiceOverride) {
               setTimeout(function() {
