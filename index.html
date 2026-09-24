@@ -94,10 +94,10 @@
               <polygon points="475,565 525,565 528,578 472,578" fill="#3d3b37" />
               <path d="M 466 525 Q 500 540 534 525 L 536 535 Q 500 550 464 535 Z" fill="#2b2a27" />
 
-              {/* Solid continuous red monopipe */}
+              <!-- Solid continuous red monopipe -->
               <polygon points="496,438 504,438 575,600 425,600" fill="url(#redPipeCylinder)" />
 
-              {/* External raised welded collar bands wrapped around the solid monopipe (NO holes) */}
+              <!-- External raised welded collar bands wrapped around the solid monopipe (NO holes) -->
               <path d="M 495 455 Q 500 458 505 455 L 505 457 Q 500 460 495 457 Z" fill="url(#redPipeFlange)" />
               <path d="M 488 494 Q 500 502 512 494 L 513 499 Q 500 507 487 499 Z" fill="url(#redPipeFlange)" />
               <path d="M 488 494 Q 500 502 512 494" fill="none" stroke="#ff9999" stroke-width="1.2" opacity="0.85" />
@@ -172,11 +172,6 @@
           </div>
         </div>
 
-        <!-- Diagnostics Toast Notification -->
-        <div id="log-toast-banner" style="position:fixed; top:18px; left:50%; transform:translateX(-50%); background:#212121; color:#ffffff; padding:8px 16px; border-radius:20px; font-family:sans-serif; font-size:12px; font-weight:600; box-shadow:0 4px 12px rgba(0,0,0,0.35); pointer-events:none; opacity:0; transition:opacity 0.25s, transform 0.25s; z-index:9999;">
-          Diagnostic logs copied to clipboard!
-        </div>
-
         <!-- Control cart console -->
         <div style="position:relative; z-index:10; width:100%; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; padding:16px 16px 40px 16px; background:linear-gradient(to top, #c9c2b1, #dcd6c7, #e6e1d4); border-top:8px solid #9e9684; box-shadow:0 -12px 28px rgba(0,0,0,0.22);">
           <div style="position:relative; width:100%; max-width:440px; background:#bbb3a1; padding:24px; border-radius:28px; box-shadow:inset 0 4px 8px rgba(0,0,0,0.25), 0 6px 14px rgba(0,0,0,0.18); border:4px solid #8e8674; display:flex; align-items:center; justify-content:space-around; gap:32px;">
@@ -201,7 +196,6 @@
                 <path d="M 19 12 L 22 11" stroke="#212121" stroke-width="1.2" stroke-linecap="round" />
                 <path d="M 19 15 L 22 16" stroke="#212121" stroke-width="1.2" stroke-linecap="round" />
               </svg>
-              <span id="ladybug-toast" style="font-size:9px; font-weight:700; color:#4a4437; letter-spacing:0.5px; margin-top:2px;">LOGS</span>
             </button>
             <!-- Horn Button -->
             <button id="standalone-horn-btn" aria-label="Horn" style="background:none; border:none; padding:0; cursor:pointer; outline:none; border-radius:50%; touch-action:manipulation;">
@@ -227,6 +221,7 @@
           </div>
         </div>
       </div>
+    </div>
 
     <!-- Isolated Sub-Sample Web Audio Engine (.mp4 AAC 256kbps @ 44.1kHz):
          - Bell: Isolated bell_clean.mp4 (1.2500s) played on cue with polyphonic layering
@@ -774,35 +769,18 @@
 
           var fullLogText = header + logHistory.join('\n') + '\n========================================';
 
-          function showToast(msg, isSuccess) {
-            var banner = document.getElementById('log-toast-banner');
-            var bugToast = document.getElementById('ladybug-toast');
-            if (bugToast) bugToast.textContent = isSuccess ? 'COPIED!' : 'FAILED';
-            if (banner) {
-              banner.textContent = msg;
-              banner.style.background = isSuccess ? '#2e7d32' : '#c62828';
-              banner.style.opacity = '1';
-              banner.style.transform = 'translateX(-50%) translateY(4px)';
-              setTimeout(function() {
-                banner.style.opacity = '0';
-                banner.style.transform = 'translateX(-50%) translateY(0)';
-                if (bugToast) bugToast.textContent = 'LOGS';
-              }, 3000);
-            }
-          }
-
           if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(fullLogText).then(function() {
-              showToast('Diagnostic logs copied to clipboard!', true);
+              log('DIAG', 'Diagnostic logs copied to clipboard.');
             }).catch(function() {
-              fallbackCopy(fullLogText, showToast);
+              fallbackCopy(fullLogText);
             });
           } else {
-            fallbackCopy(fullLogText, showToast);
+            fallbackCopy(fullLogText);
           }
         }
 
-        function fallbackCopy(text, callback) {
+        function fallbackCopy(text) {
           try {
             var textArea = document.createElement('textarea');
             textArea.value = text;
@@ -812,15 +790,11 @@
             document.body.appendChild(textArea);
             textArea.focus();
             textArea.select();
-            var success = document.execCommand('copy');
+            document.execCommand('copy');
             document.body.removeChild(textArea);
-            if (success) {
-              callback('Diagnostic logs copied to clipboard!', true);
-            } else {
-              throw new Error('execCommand returned false');
-            }
+            log('DIAG', 'Diagnostic logs copied via fallback.');
           } catch (e) {
-            callback('Could not auto-copy. See console logs.', false);
+            log('DIAG-ERR', 'Clipboard copy failed: ' + e.message);
           }
         }
 
