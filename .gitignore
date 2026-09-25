@@ -1,8 +1,12 @@
 # Ignore everything by default
 /*
 
-# Allow only index.html, audio .mp4 files, README.md, and .gitignore
+# Allow only index.html, audio .mp4 files, README.md, .gitignore, manifest, service worker, and icons
 !/index.html
 !/*.mp4
 !/README.md
 !/.gitignore
+!/manifest.json
+!/service-worker.js
+!/icon-*.png
+
