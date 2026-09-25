@@ -216,9 +216,9 @@ in this cycle (or specify which position it is currently in).
           <div style="position:relative; width:100%; max-width:440px; background:#bbb3a1; padding:24px; border-radius:28px; box-shadow:inset 0 4px 8px rgba(0,0,0,0.25), 0 6px 14px rgba(0,0,0,0.18); border:4px solid #8e8674; display:flex; align-items:center; justify-content:space-around; gap:32px;">
             <!-- 
               Ladybug Diagnostics & Copy Logs Tool
-              See top of file ladybug-rule (Current: Position 2 - bottom-right)
+              See top of file ladybug-rule (Current: Position 3 - bottom-left)
             -->
-            <button id="ladybug-log-btn" aria-label="Copy Diagnostic Logs" title="Tap to copy diagnostic logs" style="position:absolute; bottom:8px; right:12px; background:none; border:none; padding:4px; cursor:pointer; outline:none; display:flex; flex-direction:column; align-items:center; opacity:0.85; transition:transform 0.15s, opacity 0.15s; touch-action:manipulation; z-index:20;">
+            <button id="ladybug-log-btn" aria-label="Copy Diagnostic Logs" title="Tap to copy diagnostic logs" style="position:absolute; bottom:8px; left:12px; background:none; border:none; padding:4px; cursor:pointer; outline:none; display:flex; flex-direction:column; align-items:center; opacity:0.85; transition:transform 0.15s, opacity 0.15s; touch-action:manipulation; z-index:20;">
               <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
                 <!-- Ladybug Body & Head -->
                 <circle cx="12" cy="14" r="8" fill="#d32f2f" stroke="#212121" stroke-width="1.2" />
@@ -359,6 +359,16 @@ in this cycle (or specify which position it is currently in).
           hornReleaseSec: Number((HORN_RELEASE_SAMPLES / SAMPLE_RATE).toFixed(4))
         });
 
+        // iOS: WebKit gives Web-Audio-only pages the 'ambient' audio session, which the Ring/Silent switch
+        // mutes while the AudioContext still reports 'running'. Request 'playback' (Safari/WKWebView 16.4+).
+        if (navigator.audioSession) {
+          try { navigator.audioSession.type = 'playback'; } catch (e) { log('AUDIO-ERR', 'audioSession.type=playback failed: ' + e.message); }
+        }
+        log('ENV', 'isSecureContext=' + window.isSecureContext + ', audioSession=' + (navigator.audioSession ? navigator.audioSession.type : 'unavailable'));
+        document.addEventListener('visibilitychange', function() {
+          log('ENV', 'visibilitychange -> ' + document.visibilityState + (ctx ? ' (ctx ' + ctx.state + ' t=' + ctx.currentTime.toFixed(3) + ')' : ''));
+        });
+
         var ctx = null;
         var masterBus = null;
         var liveBuffers = null;
@@ -368,6 +378,7 @@ in this cycle (or specify which position it is currently in).
         var activeBellVoices = [];
         var bellStrikeCount = 0;
         var mp4DecodePromise = null;
+        var outAnalyser = null;
 
         function ensureMp4Decoded() {
           if (PCM_DATA.ready) return Promise.resolve(PCM_DATA);
@@ -386,6 +397,9 @@ in this cycle (or specify which position it is currently in).
               })
               .then(function(audioBuf) {
                 var ch = audioBuf.getChannelData(0);
+                var peak = 0;
+                for (var i = 0; i < ch.length; i++) peak = Math.max(peak, Math.abs(ch[i]));
+                log('AUDIO', 'Decoded ' + url, { length: ch.length, expected: expectedLen, sampleRate: audioBuf.sampleRate, channels: audioBuf.numberOfChannels, peak: Number(peak.toFixed(4)) });
                 var out = new Float32Array(expectedLen);
                 out.set(ch.subarray(0, Math.min(ch.length, expectedLen)));
                 return out;
@@ -491,10 +505,18 @@ in this cycle (or specify which position it is currently in).
               ctx = new AudioCtx();
             }
             masterBus = buildMasterBusForContext(ctx);
+            outAnalyser = ctx.createAnalyser();
+            outAnalyser.fftSize = 2048;
+            masterBus.connect(outAnalyser);
+            ctx.onstatechange = function() {
+              log('AUDIO', 'AudioContext statechange -> ' + ctx.state + ' @ t=' + ctx.currentTime.toFixed(3));
+            };
             liveBuffers = createBuffersForContext(ctx);
             log('AUDIO', 'Created AudioContext & isolated sample buffers', {
               state: ctx.state,
-              sampleRate: ctx.sampleRate
+              sampleRate: ctx.sampleRate,
+              baseLatency: ctx.baseLatency,
+              outputLatency: ctx.outputLatency
             });
           }
           if (ctx.state === 'suspended' || ctx.state === 'interrupted') {
@@ -506,6 +528,20 @@ in this cycle (or specify which position it is currently in).
           }
           unlockIOSAudio(ctx);
           return ctx;
+        }
+
+        // Peak of what the graph actually outputs ~150ms after a trigger. Non-zero while nothing is
+        // audible => the OS muted/misrouted it (e.g. iOS silent switch), not the sample engine.
+        function logOutputLevel(tag) {
+          if (!outAnalyser) return;
+          setTimeout(function() {
+            var buf = new Float32Array(outAnalyser.fftSize);
+            outAnalyser.getFloatTimeDomainData(buf);
+            var peak = 0;
+            for (var i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i]));
+            glitchMetrics.maxPeakLevel = Math.max(glitchMetrics.maxPeakLevel, Number(peak.toFixed(4)));
+            log('LEVEL', tag + ' graph output peak=' + peak.toFixed(4) + ' (ctx ' + ctx.state + ' t=' + ctx.currentTime.toFixed(3) + ')');
+          }, 150);
         }
 
         // =====================================================================
@@ -580,6 +616,7 @@ in this cycle (or specify which position it is currently in).
               loopStart: Number(src.loopStart.toFixed(4)),
               loopEnd: Number(src.loopEnd.toFixed(4))
             });
+            logOutputLevel('HORN');
           }
           return voice;
         }
@@ -732,6 +769,7 @@ in this cycle (or specify which position it is currently in).
               } catch (e) {}
             }, Math.ceil((bufs.bellDuration + 0.04) * 1000));
             log('BELL', 'Bell sample strike #' + bellStrikeCount + ' (activeLayeredVoices=' + activeBellVoices.length + ')');
+            logOutputLevel('BELL');
           }
         }
 
@@ -822,6 +860,7 @@ in this cycle (or specify which position it is currently in).
             'Timestamp: ' + new Date().toISOString() + '\n' +
             'UserAgent: ' + navigator.userAgent + '\n' +
             'AudioContext: ' + (ctx ? ('State=' + ctx.state + ', currentTime=' + ctx.currentTime.toFixed(3) + ', sampleRate=' + ctx.sampleRate) : 'Not instantiated') + '\n' +
+            'AudioSession: ' + (navigator.audioSession ? navigator.audioSession.type : 'unavailable') + ', isSecureContext: ' + window.isSecureContext + ', visibility: ' + document.visibilityState + '\n' +
             'isAudioUnlocked: ' + isAudioUnlocked + '\n' +
             'hornActive: ' + hornActive + '\n' +
             'bellStrikeCount: ' + bellStrikeCount + '\n' +

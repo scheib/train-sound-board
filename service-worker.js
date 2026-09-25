@@ -2,7 +2,7 @@
 // NOTE: Maintain this app so it always works if possible without this worker.
 // The service worker is purely for offline caching and PWA installability.
 
-const CACHE_NAME = 'train-sound-board-v1';
+const CACHE_NAME = 'train-sound-board-v2';
 const ASSETS = [
   './',
   './index.html',
